@@ -55,6 +55,11 @@ class StrategyParameters:
     htf_ema_period: int = 50             # 50-period EMA on HTF
     enable_session_filter: bool = False  # Restrict to London/NY killzones only
 
+    # 8. Momentum & Anti-Chop Settings
+    min_ema_separation_atr: float = 0.08  # Minimum distance between EMA9 & EMA21 in ATR (filters flat chop)
+    require_ema_slope: bool = True        # EMA9 must be actively sloping in trade direction
+    max_htf_dist_atr: float = 4.5         # Maximum distance from HTF EMA in ATR (filters overextended tops/bottoms)
+
 
 
 @dataclass
@@ -558,6 +563,21 @@ def evaluate_checklist_at_bar(
     else:
         cross_long_detail = f"No bullish EMA crossover within last {params.max_pullback_bars} bars"
 
+    # Momentum Slope & Separation Guard (Chop Filter)
+    ema_slope_long_pass = True
+    if params.require_ema_slope and current_idx >= 2:
+        ema_slope_long_pass = (c_ema9 >= ema9[current_idx - 2])
+    ema_sep_long_pass = True
+    if params.min_ema_separation_atr > 0:
+        ema_sep_long_pass = (c_ema9 - c_ema21) >= (params.min_ema_separation_atr * c_atr)
+
+    if cross_long_pass and not ema_slope_long_pass:
+        cross_long_pass = False
+        cross_long_detail += " (Blocked: EMA9 flat/curling down)"
+    elif cross_long_pass and not ema_sep_long_pass:
+        cross_long_pass = False
+        cross_long_detail += f" (Blocked: EMA separation too tight < {params.min_ema_separation_atr:.2f} ATR)"
+
     ob_long_pass = False
     matching_bull_ob = None
     ob_buffer = params.ob_buffer_atr * c_atr
@@ -642,6 +662,21 @@ def evaluate_checklist_at_bar(
         cross_short_detail = f"Bearish cross {bars_since_bear_cross} bars ago (EMA9={c_ema9:.2f}, EMA21={c_ema21:.2f})"
     else:
         cross_short_detail = f"No bearish EMA crossover within last {params.max_pullback_bars} bars"
+
+    # Momentum Slope & Separation Guard (Chop Filter)
+    ema_slope_short_pass = True
+    if params.require_ema_slope and current_idx >= 2:
+        ema_slope_short_pass = (c_ema9 <= ema9[current_idx - 2])
+    ema_sep_short_pass = True
+    if params.min_ema_separation_atr > 0:
+        ema_sep_short_pass = (c_ema21 - c_ema9) >= (params.min_ema_separation_atr * c_atr)
+
+    if cross_short_pass and not ema_slope_short_pass:
+        cross_short_pass = False
+        cross_short_detail += " (Blocked: EMA9 flat/curling up)"
+    elif cross_short_pass and not ema_sep_short_pass:
+        cross_short_pass = False
+        cross_short_detail += f" (Blocked: EMA separation too tight < {params.min_ema_separation_atr:.2f} ATR)"
 
     ob_short_pass = False
     matching_bear_ob = None
@@ -771,4 +806,25 @@ def evaluate_htf_trend(
         return "BULLISH", curr_ema, f"HTF Price (${curr_close:.2f}) > EMA{period} (${curr_ema:.2f})"
     else:
         return "BEARISH", curr_ema, f"HTF Price (${curr_close:.2f}) < EMA{period} (${curr_ema:.2f})"
+
+
+def check_htf_overextended(
+    current_price: float,
+    htf_ema: float,
+    atr: float,
+    max_dist_atr: float = 4.5
+) -> Tuple[bool, str]:
+    """
+    Checks if price is overextended from the Higher Timeframe (M15) EMA mean.
+    Prevents buying at exhaustion tops or selling at exhaustion bottoms.
+    """
+    if atr <= 0.0 or max_dist_atr <= 0.0 or htf_ema <= 0.0:
+        return False, "Filter inactive"
+
+    dist = abs(current_price - htf_ema)
+    dist_atr = dist / atr
+    if dist_atr > max_dist_atr:
+        return True, f"Price (${current_price:.2f}) is overextended by {dist_atr:.1f} ATR (> {max_dist_atr:.1f} ATR limit) from HTF EMA (${htf_ema:.2f})"
+    return False, f"Price distance {dist_atr:.1f} ATR is within safe mean boundary"
+
 

@@ -6,8 +6,7 @@ Features:
 3. Smart Dynamic ATR-Buffered SL & TP (Minimum $1.80 breathing room prevents stop-hunting)
 4. Dynamic Auto Break-Even Shield (Moves SL to entry + spread at 50% TP progress)
 5. Single Active Position Enforcement (Prevents dangerous stacking/over-leveraging)
-6. Post-Loss Cooling Guard (3-minute circuit pause prevents revenge whipsaws)
-7. Configurable 0.01 Micro-Lot Size & Expanded $500 Daily Loss Limit
+6. Post-Loss Cooling Guard (5-minute circuit pause prevents revenge whipsaws)
 """
 
 import time
@@ -26,6 +25,7 @@ from trading_bot.strategy import (
     calculate_sl_tp,
     calculate_atr,
     evaluate_htf_trend,
+    check_htf_overextended,
     is_in_killzone
 )
 from trading_bot.circuit_breakers import CircuitBreakerConfig, CircuitBreakerManager
@@ -36,9 +36,10 @@ def run_live_auto_trading():
     print("=" * 85, flush=True)
     print("🚀 STARTING INSTITUTIONAL PRO SCALPER ENGINE (XAUUSD M1)", flush=True)
     print("🛡️ ACTIVE CONFLUENCES: M15 Trend Align | Break-Even Shield | Smart ATR Buffer", flush=True)
+    print("🎯 PROFIT GUARDS: Momentum Expansion | HTF Overextension Guard | Daily Target Lock", flush=True)
     print("=" * 85, flush=True)
 
-    # Strategy Parameters
+    # Institutional-Grade Parameters
     params = StrategyParameters()
     params.max_pullback_bars = 35        # Realistic pullback window
     params.ob_buffer_atr = 0.35          # Clean Order Block retest zone
@@ -50,8 +51,15 @@ def run_live_auto_trading():
     params.enable_htf_filter = True      # Strictly trade with M15 macro trend
     params.enable_session_filter = False # Set True to ONLY trade London/NY Killzones
 
-    # Trading Volume & Risk Settings
+    # Advanced Momentum & Mean-Reversion Filters
+    params.min_ema_separation_atr = 0.08 # Filters flat/tangling EMAs in sideways chop
+    params.require_ema_slope = True      # EMA9 must be actively expanding in trade direction
+    params.max_htf_dist_atr = 4.5       # Prevents buying at exhausted tops or selling bottoms
+
+    # Trading Volume & Profit Lock Settings
     trade_lot_size = 0.01                # Micro-lot 0.01 for safe scaling and testing
+    daily_profit_target_usd = 25.0       # Daily Profit Goal ($25.00 on 0.01 lot = 250 pips)
+    enable_daily_profit_lock = True      # Automatically locks profits and pauses for the day when target hit
 
     cb_config = CircuitBreakerConfig(
         bypass_noise_gate_for_demo=True,
@@ -71,14 +79,19 @@ def run_live_auto_trading():
     algo_allowed = mt5_bridge.is_algo_trading_enabled()
 
     print(f"✅ Connected to MT5 Account: {acc.login} | Mode: {acc.trade_mode} | Balance: ${acc.balance:,.2f}", flush=True)
-    print(f"⚡ Target Symbol: {mt5_bridge.symbol} | Default Lot Size: {trade_lot_size} | Algo Allowed: {algo_allowed}", flush=True)
+    print(f"⚡ Target Symbol: {mt5_bridge.symbol} | Default Lot: {trade_lot_size} | Algo Allowed: {algo_allowed}", flush=True)
+    print(f"🔒 Daily Profit Target: ${daily_profit_target_usd:.2f} (Lock Active: {enable_daily_profit_lock})", flush=True)
     print("⚡ Auto-Scanner active. Streaming live ticks every 3 seconds...\n", flush=True)
 
     last_evaluated_time = 0
     last_loss_time = 0
+    last_target_print_time = 0
     start_session_time = int(time.time())
     processed_deal_tickets = set()
     be_moved_tickets = set()
+
+    session_realized_pnl = 0.0
+    session_consecutive_losses = 0
 
     try:
         while True:
@@ -128,11 +141,17 @@ def run_live_auto_trading():
                         storage.update_closed_trade(ticket, exit_p, pnl, exit_reason="MT5 Deal Closed")
                         cb_manager.record_trade_outcome(net_pnl_usd=pnl, current_balance=acc.balance)
 
+                        session_realized_pnl += pnl
                         if pnl < 0:
+                            session_consecutive_losses += 1
                             last_loss_time = time.time()
-                            print(f"⚠️ [TRADE CLOSED - LOSS] Deal #{ticket} closed at -${abs(pnl):.2f}. Cooling down for 3 mins.", flush=True)
+                            if session_consecutive_losses >= 3:
+                                print(f"🛑 [CIRCUIT PAUSE] {session_consecutive_losses} consecutive losses. Session pausing for 30 minutes to protect capital.", flush=True)
+                            else:
+                                print(f"⚠️ [TRADE CLOSED - LOSS] Deal #{ticket} closed at -${abs(pnl):.2f}. Session PnL: ${session_realized_pnl:+.2f}. Cooling down for 3 mins.", flush=True)
                         else:
-                            print(f"🎉 [TRADE CLOSED - WIN] Deal #{ticket} closed at +${pnl:.2f} profit!", flush=True)
+                            session_consecutive_losses = 0
+                            print(f"🎉 [TRADE CLOSED - WIN] Deal #{ticket} closed at +${pnl:.2f} profit! Session PnL: ${session_realized_pnl:+.2f}", flush=True)
 
             # 3. Fetch live M1 bars
             bars = mt5_bridge.get_rates(count=150)
@@ -149,9 +168,10 @@ def run_live_auto_trading():
 
             curr_idx = len(closes) - 1
 
-            # 4. Fetch M15 bars for Macro Trend Alignment
+            # 4. Fetch M15 bars for Macro Trend Alignment and Overextension
             htf_trend = "NEUTRAL"
             htf_reason = "HTF Filter Disabled"
+            htf_ema = 0.0
             try:
                 htf_data = mt5_bridge.fetch_htf_bars(count=80, timeframe="M15")
                 if htf_data and len(htf_data["closes"]) >= 50:
@@ -173,6 +193,12 @@ def run_live_auto_trading():
             atr_vals = calculate_atr(highs, lows, closes, period=14)
             curr_atr = atr_vals[-1] if atr_vals else 1.0
 
+            # 6b. Check HTF Overextension Guard
+            is_overextended = False
+            overext_reason = ""
+            if htf_ema > 0:
+                is_overextended, overext_reason = check_htf_overextended(closes[-1], htf_ema, curr_atr, params.max_htf_dist_atr)
+
             now_str = datetime.now(timezone.utc).strftime("%H:%M:%S")
 
             # 7. Print Diagnostic Output on M1 Candle Close
@@ -185,8 +211,8 @@ def run_live_auto_trading():
                 pos_status = f"{len(open_positions)} OPEN ({open_positions[0]['direction']})" if open_positions else "0 OPEN"
 
                 print(
-                    f"\n🕯️ [{now_str} UTC | M1 CLOSE] Price: ${closes[-1]:.2f} | ATR: ${curr_atr:.2f} | Session: {killzone_name}\n"
-                    f"   ├─ 🧭 M15 Macro Trend: {htf_trend} ({htf_reason})\n"
+                    f"\n🕯️ [{now_str} UTC | M1 CLOSE] Price: ${closes[-1]:.2f} | ATR: ${curr_atr:.2f} | PnL: ${session_realized_pnl:+.2f} | Session: {killzone_name}\n"
+                    f"   ├─ 🧭 M15 Trend: {htf_trend} ({htf_reason})\n"
                     f"   ├─ 🟢 BUY Setup ({buy_passed_count}/5): VWAP={long_st.vwap_pass} | Cross={long_st.crossover_pass} | OB={long_st.ob_pass} | Pullback={long_st.pullback_pass} | Candle={long_st.confirmation_pass}\n"
                     f"   ├─ 🔴 SELL Setup ({sell_passed_count}/5): VWAP={short_st.vwap_pass} | Cross={short_st.crossover_pass} | OB={short_st.ob_pass} | Pullback={short_st.pullback_pass} | Candle={short_st.confirmation_pass}\n"
                     f"   └─ 🛡️ Active Positions: {pos_status}",
@@ -195,11 +221,22 @@ def run_live_auto_trading():
 
             # ================= STRICT RISK SHIELDS =================
 
+            # Shield 0: Daily Profit Target Lock (Protects Banked Profits)
+            if enable_daily_profit_lock and session_realized_pnl >= daily_profit_target_usd:
+                if (time.time() - last_target_print_time) > 300:
+                    last_target_print_time = time.time()
+                    print(f"🏆 [DAILY TARGET LOCKED] Session Net Profit (+${session_realized_pnl:.2f}) reached goal of ${daily_profit_target_usd:.2f}! Trading locked for today to protect capital.", flush=True)
+                continue
+
             # Shield 1: Single Active Position Guard
             if len(open_positions) >= 1:
                 continue
 
-            # Shield 2: 3-Minute Post-Loss Cooling Period
+            # Shield 2a: 3 Consecutive Losses -> Extended 30-Minute Breather
+            if session_consecutive_losses >= 3 and (time.time() - last_loss_time) < 1800:
+                continue
+
+            # Shield 2b: Standard 3-Minute Post-Loss Cooling Period
             if (time.time() - last_loss_time) < (cb_config.cooldown_after_loss_minutes * 60):
                 continue
 
@@ -221,12 +258,17 @@ def run_live_auto_trading():
                 continue
 
             # ================= EXECUTE BUY ORDER =================
+            # Must satisfy all 5 M1 checklist items + M15 HTF Bullish alignment
             if long_st.all_passed:
                 if params.enable_htf_filter and htf_trend == "BEARISH":
                     print(f"⚠️ [FILTER BLOCKED] M1 BUY Signal skipped: M15 Macro Trend is BEARISH (Counter-trend protection)", flush=True)
                     continue
 
-                print(f"\n🎯 >>> ALL CONFLUENCES ALIGNED: EXECUTING BUY ORDER (Lot: {trade_lot_size}) AT ${sym_info.ask:.2f} <<<", flush=True)
+                if is_overextended:
+                    print(f"⚠️ [OVEREXTENSION BLOCKED] M1 BUY Signal skipped: {overext_reason}", flush=True)
+                    continue
+
+                print(f"\n🎯 >>> ALL CONFLUENCES ALIGNED: EXECUTING BUY ORDER AT ${sym_info.ask:.2f} <<<", flush=True)
                 print(f"   SL: ${long_st.suggested_sl:.2f} (Risk: ${long_st.risk_points:.2f}) | TP: ${long_st.suggested_tp:.2f} (Reward: ${long_st.reward_points:.2f})", flush=True)
                 
                 res = mt5_bridge.send_order(
@@ -256,12 +298,17 @@ def run_live_auto_trading():
                     print(f"❌ Order Failed: {msg}\n", flush=True)
 
             # ================= EXECUTE SELL ORDER =================
+            # Must satisfy all 5 M1 checklist items + M15 HTF Bearish alignment
             elif short_st.all_passed:
                 if params.enable_htf_filter and htf_trend == "BULLISH":
                     print(f"⚠️ [FILTER BLOCKED] M1 SELL Signal skipped: M15 Macro Trend is BULLISH (Counter-trend protection)", flush=True)
                     continue
 
-                print(f"\n🎯 >>> ALL CONFLUENCES ALIGNED: EXECUTING SELL ORDER (Lot: {trade_lot_size}) AT ${sym_info.bid:.2f} <<<", flush=True)
+                if is_overextended:
+                    print(f"⚠️ [OVEREXTENSION BLOCKED] M1 SELL Signal skipped: {overext_reason}", flush=True)
+                    continue
+
+                print(f"\n🎯 >>> ALL CONFLUENCES ALIGNED: EXECUTING SELL ORDER AT ${sym_info.bid:.2f} <<<", flush=True)
                 print(f"   SL: ${short_st.suggested_sl:.2f} (Risk: ${short_st.risk_points:.2f}) | TP: ${short_st.suggested_tp:.2f} (Reward: ${short_st.reward_points:.2f})", flush=True)
 
                 res = mt5_bridge.send_order(
