@@ -25,21 +25,20 @@ from trading_bot.strategy import (
     calculate_sl_tp,
     calculate_atr,
     evaluate_htf_trend,
-    check_htf_overextended,
     is_in_killzone
 )
 from trading_bot.circuit_breakers import CircuitBreakerConfig, CircuitBreakerManager
 from trading_bot.storage import BotStorage
+from trading_bot.news_filter import EconomicNewsFilter
 
 
 def run_live_auto_trading():
     print("=" * 85, flush=True)
     print("🚀 STARTING INSTITUTIONAL PRO SCALPER ENGINE (XAUUSD M1)", flush=True)
     print("🛡️ ACTIVE CONFLUENCES: M15 Trend Align | Break-Even Shield | Smart ATR Buffer", flush=True)
-    print("🎯 PROFIT GUARDS: Momentum Expansion | HTF Overextension Guard | Daily Target Lock", flush=True)
     print("=" * 85, flush=True)
 
-    # Institutional-Grade Parameters
+    # Institutional-Grade Parameters (Restored to Proven Winning Configuration)
     params = StrategyParameters()
     params.max_pullback_bars = 35        # Realistic pullback window
     params.ob_buffer_atr = 0.35          # Clean Order Block retest zone
@@ -50,11 +49,6 @@ def run_live_auto_trading():
     params.max_sl_distance_points = 6.0  # Max $6.00 SL on Gold
     params.enable_htf_filter = True      # Strictly trade with M15 macro trend
     params.enable_session_filter = False # Set True to ONLY trade London/NY Killzones
-
-    # Advanced Momentum & Mean-Reversion Filters
-    params.min_ema_separation_atr = 0.08 # Filters flat/tangling EMAs in sideways chop
-    params.require_ema_slope = True      # EMA9 must be actively expanding in trade direction
-    params.max_htf_dist_atr = 4.5       # Prevents buying at exhausted tops or selling bottoms
 
     # Trading Volume & Profit Lock Settings
     trade_lot_size = 0.01                # Micro-lot 0.01 for safe scaling and testing
@@ -70,6 +64,14 @@ def run_live_auto_trading():
     cb_manager = CircuitBreakerManager(config=cb_config)
     storage = BotStorage()
     mt5_bridge = MT5Bridge(symbol="XAUUSDm")
+    news_filter = EconomicNewsFilter(target_currencies=["USD"], freeze_before_mins=15, freeze_after_mins=15)
+    print("📡 Loading High-Impact Economic News Calendar (ForexFactory)...", flush=True)
+    news_filter.fetch_calendar_events()
+    next_ev = news_filter.get_next_upcoming_event()
+    if next_ev:
+        print(f"📅 Next High-Impact News: '{next_ev['title']}' at {next_ev['time_utc'].strftime('%Y-%m-%d %H:%M UTC')}", flush=True)
+    else:
+        print("📅 No immediate High-Impact USD events in calendar window.", flush=True)
 
     if not mt5_bridge.connect():
         print("❌ Could not connect to MetaTrader 5 terminal. Exiting.", flush=True)
@@ -145,10 +147,10 @@ def run_live_auto_trading():
                         if pnl < 0:
                             session_consecutive_losses += 1
                             last_loss_time = time.time()
-                            if session_consecutive_losses >= 3:
-                                print(f"🛑 [CIRCUIT PAUSE] {session_consecutive_losses} consecutive losses. Session pausing for 30 minutes to protect capital.", flush=True)
+                            if session_consecutive_losses >= 2:
+                                print(f"🛑 [CIRCUIT PAUSE] {session_consecutive_losses} consecutive losses detected! Market appears choppy/whipsawing. Bot is PAUSING for 45 minutes to protect capital.", flush=True)
                             else:
-                                print(f"⚠️ [TRADE CLOSED - LOSS] Deal #{ticket} closed at -${abs(pnl):.2f}. Session PnL: ${session_realized_pnl:+.2f}. Cooling down for 3 mins.", flush=True)
+                                print(f"⚠️ [TRADE CLOSED - LOSS] Deal #{ticket} closed at -${abs(pnl):.2f}. Session PnL: ${session_realized_pnl:+.2f}. Cooling down for 5 mins.", flush=True)
                         else:
                             session_consecutive_losses = 0
                             print(f"🎉 [TRADE CLOSED - WIN] Deal #{ticket} closed at +${pnl:.2f} profit! Session PnL: ${session_realized_pnl:+.2f}", flush=True)
@@ -193,12 +195,6 @@ def run_live_auto_trading():
             atr_vals = calculate_atr(highs, lows, closes, period=14)
             curr_atr = atr_vals[-1] if atr_vals else 1.0
 
-            # 6b. Check HTF Overextension Guard
-            is_overextended = False
-            overext_reason = ""
-            if htf_ema > 0:
-                is_overextended, overext_reason = check_htf_overextended(closes[-1], htf_ema, curr_atr, params.max_htf_dist_atr)
-
             now_str = datetime.now(timezone.utc).strftime("%H:%M:%S")
 
             # 7. Print Diagnostic Output on M1 Candle Close
@@ -210,9 +206,13 @@ def run_live_auto_trading():
 
                 pos_status = f"{len(open_positions)} OPEN ({open_positions[0]['direction']})" if open_positions else "0 OPEN"
 
+                is_news_f, news_stat_msg, _ = news_filter.is_news_freeze_active()
+                news_disp = "🚨 FREEZE ACTIVE (" + news_stat_msg + ")" if is_news_f else "🟢 CLEAR"
+
                 print(
                     f"\n🕯️ [{now_str} UTC | M1 CLOSE] Price: ${closes[-1]:.2f} | ATR: ${curr_atr:.2f} | PnL: ${session_realized_pnl:+.2f} | Session: {killzone_name}\n"
                     f"   ├─ 🧭 M15 Trend: {htf_trend} ({htf_reason})\n"
+                    f"   ├─ 📰 News Shield: {news_disp}\n"
                     f"   ├─ 🟢 BUY Setup ({buy_passed_count}/5): VWAP={long_st.vwap_pass} | Cross={long_st.crossover_pass} | OB={long_st.ob_pass} | Pullback={long_st.pullback_pass} | Candle={long_st.confirmation_pass}\n"
                     f"   ├─ 🔴 SELL Setup ({sell_passed_count}/5): VWAP={short_st.vwap_pass} | Cross={short_st.crossover_pass} | OB={short_st.ob_pass} | Pullback={short_st.pullback_pass} | Candle={short_st.confirmation_pass}\n"
                     f"   └─ 🛡️ Active Positions: {pos_status}",
@@ -232,16 +232,19 @@ def run_live_auto_trading():
             if len(open_positions) >= 1:
                 continue
 
-            # Shield 2a: 3 Consecutive Losses -> Extended 30-Minute Breather
-            if session_consecutive_losses >= 3 and (time.time() - last_loss_time) < 1800:
-                continue
+            # Shield 2a: 2 Consecutive Losses -> Extended 45-Minute Breather to protect capital
+            if session_consecutive_losses >= 2:
+                time_since_loss = time.time() - last_loss_time
+                if time_since_loss < 2700:  # 45 minutes = 2700 seconds
+                    rem_mins = int((2700 - time_since_loss) / 60)
+                    continue
 
-            # Shield 2b: Standard 3-Minute Post-Loss Cooling Period
+            # Shield 2b: Standard 5-Minute Post-Loss Cooling Period
             if (time.time() - last_loss_time) < (cb_config.cooldown_after_loss_minutes * 60):
                 continue
 
-            # Shield 3: Dead-Market Anti-Chop Filter
-            if curr_atr < 0.45:  # Gold M1 ATR < $0.45 indicates flat range trap
+            # Shield 3: Dead-Market Anti-Chop Filter (Gold M1 ATR < $0.70 indicates flat range trap)
+            if curr_atr < 0.70:
                 continue
 
             # Shield 4: Session Killzone Filter (Optional)
@@ -257,15 +260,19 @@ def run_live_auto_trading():
             if not can_trade:
                 continue
 
+            # Shield 6: Automated High-Impact Economic News Shield (NFP, CPI, FOMC, etc.)
+            is_news_freeze, news_reason, _ = news_filter.is_news_freeze_active()
+            if is_news_freeze:
+                if (time.time() - last_loss_time) > 60:
+                    # Print once per minute to avoid spamming
+                    print(f"🛑 [NEWS SHIELD BLOCKED] {news_reason}", flush=True)
+                continue
+
             # ================= EXECUTE BUY ORDER =================
             # Must satisfy all 5 M1 checklist items + M15 HTF Bullish alignment
             if long_st.all_passed:
                 if params.enable_htf_filter and htf_trend == "BEARISH":
                     print(f"⚠️ [FILTER BLOCKED] M1 BUY Signal skipped: M15 Macro Trend is BEARISH (Counter-trend protection)", flush=True)
-                    continue
-
-                if is_overextended:
-                    print(f"⚠️ [OVEREXTENSION BLOCKED] M1 BUY Signal skipped: {overext_reason}", flush=True)
                     continue
 
                 print(f"\n🎯 >>> ALL CONFLUENCES ALIGNED: EXECUTING BUY ORDER AT ${sym_info.ask:.2f} <<<", flush=True)
@@ -302,10 +309,6 @@ def run_live_auto_trading():
             elif short_st.all_passed:
                 if params.enable_htf_filter and htf_trend == "BULLISH":
                     print(f"⚠️ [FILTER BLOCKED] M1 SELL Signal skipped: M15 Macro Trend is BULLISH (Counter-trend protection)", flush=True)
-                    continue
-
-                if is_overextended:
-                    print(f"⚠️ [OVEREXTENSION BLOCKED] M1 SELL Signal skipped: {overext_reason}", flush=True)
                     continue
 
                 print(f"\n🎯 >>> ALL CONFLUENCES ALIGNED: EXECUTING SELL ORDER AT ${sym_info.bid:.2f} <<<", flush=True)
