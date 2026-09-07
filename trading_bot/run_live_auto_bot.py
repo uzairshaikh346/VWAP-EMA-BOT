@@ -38,28 +38,29 @@ def run_live_auto_trading():
     print("🛡️ ACTIVE CONFLUENCES: M15 Trend Align | Break-Even Shield | Smart ATR Buffer", flush=True)
     print("=" * 85, flush=True)
 
-    # Institutional-Grade Parameters (Restored to Proven Winning Configuration)
+    # Institutional-Grade Parameters (Optimized Quick Scalper for Gold M1)
     params = StrategyParameters()
-    params.max_pullback_bars = 35        # Realistic pullback window
+    params.max_pullback_bars = 30        # Realistic pullback window
     params.ob_buffer_atr = 0.35          # Clean Order Block retest zone
-    params.pullback_atr_mult = 1.8       # Proximity to EMA 9/21 zone
-    params.rr_ratio = 1.5                # 1:1.5 Risk:Reward
-    params.sl_buffer_atr = 0.50          # 0.5 ATR cushion beyond swing pivots
-    params.min_sl_distance_points = 1.8  # Minimum $1.80 SL on Gold to survive wicks
-    params.max_sl_distance_points = 6.0  # Max $6.00 SL on Gold
+    params.pullback_atr_mult = 1.6       # Proximity to EMA 9/21 zone
+    params.rr_ratio = 1.25               # Realistic 1:1.25 Risk:Reward for fast scalping
+    params.sl_lookback_bars = 4          # Tight recent swing lookback
+    params.sl_buffer_atr = 0.25          # Tight cushion beyond swing pivots
+    params.min_sl_distance_points = 1.50 # Minimum $1.50 SL on Gold
+    params.max_sl_distance_points = 2.50 # Capped Maximum $2.50 SL (Limits max loss to ~$2.50!)
     params.enable_htf_filter = True      # Strictly trade with M15 macro trend
     params.enable_session_filter = False # Set True to ONLY trade London/NY Killzones
 
     # Trading Volume & Profit Lock Settings
     trade_lot_size = 0.01                # Micro-lot 0.01 for safe scaling and testing
-    daily_profit_target_usd = 25.0       # Daily Profit Goal ($25.00 on 0.01 lot = 250 pips)
+    daily_profit_target_usd = 15.0       # Daily Profit Goal ($15.00 on 0.01 lot = 150 pips)
     enable_daily_profit_lock = True      # Automatically locks profits and pauses for the day when target hit
 
     cb_config = CircuitBreakerConfig(
         bypass_noise_gate_for_demo=True,
-        max_consecutive_losses=6,        # Relaxed consecutive loss count
-        max_daily_loss_usd=500.0,        # Increased daily loss ceiling ($500.00)
-        cooldown_after_loss_minutes=3
+        max_consecutive_losses=3,        # Pause after 3 consecutive losses
+        max_daily_loss_usd=15.0,         # STRICT Daily Capital Shield: Stop trading if -$15 hit today!
+        cooldown_after_loss_minutes=5
     )
     cb_manager = CircuitBreakerManager(config=cb_config)
     storage = BotStorage()
@@ -88,6 +89,7 @@ def run_live_auto_trading():
     last_evaluated_time = 0
     last_loss_time = 0
     last_target_print_time = 0
+    last_toxic_print_time = 0
     start_session_time = int(time.time())
     processed_deal_tickets = set()
     be_moved_tickets = set()
@@ -250,6 +252,15 @@ def run_live_auto_trading():
             # Shield 4: Session Killzone Filter (Optional)
             if params.enable_session_filter and not in_killzone:
                 continue
+
+            # Shield 4b: High-Risk Whipsaw Hours Shield (10:00-15:00 UTC US Open / London Close chop)
+            if getattr(params, "avoid_toxic_hours", True):
+                current_utc_hour = datetime.now(timezone.utc).hour
+                if current_utc_hour in [10, 12, 13, 14, 15]:
+                    if (time.time() - last_toxic_print_time) > 600:
+                        last_toxic_print_time = time.time()
+                        print(f"⏸️ [CHOP SHIELD] Hour {current_utc_hour:02d}:00 UTC is in the High-Risk Whipsaw Zone (historical -$180 loss window). Pausing entries until clean market flow.", flush=True)
+                    continue
 
             # Shield 5: Circuit Breakers (Max consecutive losses / daily loss)
             can_trade, reason = cb_manager.can_open_trade(

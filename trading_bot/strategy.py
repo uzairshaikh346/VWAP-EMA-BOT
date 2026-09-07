@@ -43,17 +43,18 @@ class StrategyParameters:
     pinbar_wick_ratio: float = 2.0      # Rejection wick ratio (ZAROORI)
     pinbar_nose_ratio: float = 0.5      # Nose ratio (ZAROORI)
 
-    # 6. Exit & Risk:Reward Settings
-    rr_ratio: float = 1.5               # Risk:Reward Ratio (1:1.5)
-    sl_lookback_bars: int = 8           # Lookback bars for recent swing low/high
-    sl_buffer_atr: float = 0.50         # Extra cushion beyond swing in ATR (breathing room)
-    min_sl_distance_points: float = 1.8  # Minimum SL in USD ($1.80 on Gold to avoid noise)
-    max_sl_distance_points: float = 6.0  # Maximum allowable SL ($6.00 on Gold)
+    # 6. Exit & Risk:Reward Settings (Optimized Scalping for Gold M1)
+    rr_ratio: float = 1.25              # Realistic Scalper Risk:Reward Ratio (1:1.25)
+    sl_lookback_bars: int = 5           # Tight recent swing lookback
+    sl_buffer_atr: float = 0.25         # Tight cushion beyond swing in ATR
+    min_sl_distance_points: float = 1.5 # Minimum SL in USD ($1.50 on Gold)
+    max_sl_distance_points: float = 2.8 # Capped Maximum SL ($2.80 on Gold - prevents big losses!)
 
     # 7. Multi-Timeframe & Session Settings
     enable_htf_filter: bool = True       # Enforce 15M / 5M HTF trend alignment
     htf_ema_period: int = 50             # 50-period EMA on HTF
     enable_session_filter: bool = False  # Restrict to London/NY killzones only
+    avoid_toxic_hours: bool = True       # Avoid 10:00-15:00 UTC Chop (proven -$180 loss zone)
 
 
 
@@ -268,22 +269,24 @@ def detect_order_blocks_causal(
 ) -> List[OrderBlock]:
     """
     Detects Order Blocks strictly causally up to current_idx.
+    Optimized sliding window to maintain fast performance across 100k+ bars.
     """
     if current_idx < params.ob_swing_lookback * 2 + 5:
         return []
 
-    window_start = max(0, current_idx - (params.ob_max_age_bars + params.ob_swing_lookback * 3))
-    sub_highs = highs[:current_idx + 1]
-    sub_lows = lows[:current_idx + 1]
-    sub_opens = opens[:current_idx + 1]
-    sub_closes = closes[:current_idx + 1]
+    window_size = params.ob_max_age_bars + params.ob_swing_lookback * 3
+    window_start = max(0, current_idx - window_size)
+    sub_highs = highs[window_start:current_idx + 1]
+    sub_lows = lows[window_start:current_idx + 1]
+    sub_opens = opens[window_start:current_idx + 1]
+    sub_closes = closes[window_start:current_idx + 1]
 
     swing_highs, swing_lows = find_causal_swings(sub_highs, sub_lows, params.ob_swing_lookback)
 
     order_blocks: List[OrderBlock] = []
-    start_eval = max(params.ob_swing_lookback * 2, window_start)
+    start_eval = max(params.ob_swing_lookback * 2, len(sub_highs) - params.ob_max_age_bars)
 
-    for i in range(start_eval, current_idx + 1):
+    for i in range(start_eval, len(sub_highs)):
         confirmed_sh = [sh for sh in swing_highs if sh['confirmed_at'] < i and sh['index'] < i]
         if confirmed_sh:
             last_sh = confirmed_sh[-1]
@@ -296,16 +299,18 @@ def detect_order_blocks_causal(
                 if ob_idx is not None:
                     zone_l = sub_lows[ob_idx] if params.ob_zone_type == "full" else min(sub_opens[ob_idx], sub_closes[ob_idx])
                     zone_h = sub_highs[ob_idx] if params.ob_zone_type == "full" else max(sub_opens[ob_idx], sub_closes[ob_idx])
+                    global_ob_idx = window_start + ob_idx
+                    global_i = window_start + i
                     ob = OrderBlock(
-                        id=f"BULL_OB_{ob_idx}",
+                        id=f"BULL_OB_{global_ob_idx}",
                         direction="BULLISH",
-                        bar_index=ob_idx,
-                        time=times[ob_idx] if ob_idx < len(times) else str(ob_idx),
+                        bar_index=global_ob_idx,
+                        time=times[global_ob_idx] if global_ob_idx < len(times) else str(global_ob_idx),
                         open=sub_opens[ob_idx],
                         high=sub_highs[ob_idx],
                         low=sub_lows[ob_idx],
                         close=sub_closes[ob_idx],
-                        bos_bar_index=i,
+                        bos_bar_index=global_i,
                         bos_level=last_sh['price'],
                         zone_low=zone_l,
                         zone_high=zone_h,
@@ -326,16 +331,18 @@ def detect_order_blocks_causal(
                 if ob_idx is not None:
                     zone_l = sub_lows[ob_idx] if params.ob_zone_type == "full" else min(sub_opens[ob_idx], sub_closes[ob_idx])
                     zone_h = sub_highs[ob_idx] if params.ob_zone_type == "full" else max(sub_opens[ob_idx], sub_closes[ob_idx])
+                    global_ob_idx = window_start + ob_idx
+                    global_i = window_start + i
                     ob = OrderBlock(
-                        id=f"BEAR_OB_{ob_idx}",
+                        id=f"BEAR_OB_{global_ob_idx}",
                         direction="BEARISH",
-                        bar_index=ob_idx,
-                        time=times[ob_idx] if ob_idx < len(times) else str(ob_idx),
+                        bar_index=global_ob_idx,
+                        time=times[global_ob_idx] if global_ob_idx < len(times) else str(global_ob_idx),
                         open=sub_opens[ob_idx],
                         high=sub_highs[ob_idx],
                         low=sub_lows[ob_idx],
                         close=sub_closes[ob_idx],
-                        bos_bar_index=i,
+                        bos_bar_index=global_i,
                         bos_level=last_sl['price'],
                         zone_low=zone_l,
                         zone_high=zone_h,
@@ -355,16 +362,16 @@ def detect_order_blocks_causal(
         mitigated = False
         for b in range(ob.bos_bar_index + 1, current_idx + 1):
             if ob.direction == "BULLISH":
-                if sub_closes[b] < ob.zone_low:
+                if closes[b] < ob.zone_low:
                     invalidated = True
                     break
-                if sub_lows[b] <= ob.zone_high and sub_highs[b] >= ob.zone_low:
+                if lows[b] <= ob.zone_high and highs[b] >= ob.zone_low:
                     mitigated = True
             else:
-                if sub_closes[b] > ob.zone_high:
+                if closes[b] > ob.zone_high:
                     invalidated = True
                     break
-                if sub_highs[b] >= ob.zone_low and sub_lows[b] <= ob.zone_high:
+                if highs[b] >= ob.zone_low and lows[b] <= ob.zone_high:
                     mitigated = True
 
         if invalidated:
