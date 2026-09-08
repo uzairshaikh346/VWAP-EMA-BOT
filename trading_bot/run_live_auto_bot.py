@@ -49,7 +49,7 @@ def run_live_auto_trading():
     params.min_sl_distance_points = 1.50 # Minimum $1.50 SL on Gold
     params.max_sl_distance_points = 2.50 # Capped Maximum $2.50 SL (Limits max loss to ~$2.50!)
     params.enable_htf_filter = True      # Strictly trade with M15 macro trend
-    params.enable_session_filter = True  # Strictly trade during verified Golden Windows (05:00-09:30 UTC & 16:00-20:30 UTC)
+    params.enable_session_filter = False # Allow profitable Asian & Morning sessions (Pakistan 3:00 AM - 11:00 AM)
 
     # Trading Volume & Profit Lock Settings
     trade_lot_size = 0.01                # Micro-lot 0.01 for safe scaling and testing
@@ -308,7 +308,7 @@ def run_live_auto_trading():
             if params.enable_session_filter and not in_killzone:
                 if (time.time() - last_session_print_time) > 600:
                     last_session_print_time = time.time()
-                    print(f"⏸️ [SESSION REST] {session_name}. Active Golden Windows: 05:00-09:30 UTC (London) & 16:00-20:30 UTC (US Flow). Bot resting safely.", flush=True)
+                    print(f"⏸️ [SESSION REST] {killzone_name}. Active Golden Windows: 05:00-09:30 UTC (London) & 16:00-20:30 UTC (US Flow). Bot resting safely.", flush=True)
                 continue
 
             # Shield 4b: High-Risk Whipsaw Hours Shield (10:00-15:00 UTC US Open / London Close chop)
