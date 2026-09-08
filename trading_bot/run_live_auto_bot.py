@@ -49,11 +49,11 @@ def run_live_auto_trading():
     params.min_sl_distance_points = 1.50 # Minimum $1.50 SL on Gold
     params.max_sl_distance_points = 2.50 # Capped Maximum $2.50 SL (Limits max loss to ~$2.50!)
     params.enable_htf_filter = True      # Strictly trade with M15 macro trend
-    params.enable_session_filter = False # Set True to ONLY trade London/NY Killzones
+    params.enable_session_filter = True  # Strictly trade during verified Golden Windows (05:00-09:30 UTC & 16:00-20:30 UTC)
 
     # Trading Volume & Profit Lock Settings
     trade_lot_size = 0.01                # Micro-lot 0.01 for safe scaling and testing
-    daily_profit_target_usd = 15.0       # Daily Profit Goal ($15.00 on 0.01 lot = 150 pips)
+    daily_profit_target_usd = 10.0       # Daily Profit Goal ($10.00 on 0.01 lot = 100 pips / 3-4 clean scalps)
     enable_daily_profit_lock = True      # Automatically locks profits and pauses for the day when target hit
 
     cb_config = CircuitBreakerConfig(
@@ -90,9 +90,10 @@ def run_live_auto_trading():
     last_loss_time = 0
     last_target_print_time = 0
     last_toxic_print_time = 0
+    last_session_print_time = 0
     start_session_time = int(time.time())
     processed_deal_tickets = set()
-    be_moved_tickets = set()
+    trailing_tracker: Dict[int, Dict[str, Any]] = {}
 
     session_realized_pnl = 0.0
     session_consecutive_losses = 0
@@ -101,9 +102,16 @@ def run_live_auto_trading():
         while True:
             time.sleep(3)
 
-            # 1. Fetch live open positions and apply Auto Break-Even
+            # 1. Fetch live open positions and apply 3-Tier Smart Trailing SL with Spread Cushion
             open_positions = mt5_bridge.get_open_positions()
             sym_info = mt5_bridge.get_symbol_info()
+            spread = max(0.20, min(0.60, float(sym_info.spread_usd or 0.25))) if sym_info else 0.25
+
+            # Cleanup closed tickets from tracking map
+            active_tickets = {p["ticket"] for p in open_positions}
+            for t in list(trailing_tracker.keys()):
+                if t not in active_tickets:
+                    del trailing_tracker[t]
 
             for pos in open_positions:
                 ticket = pos["ticket"]
@@ -113,34 +121,80 @@ def run_live_auto_trading():
                 sl = pos["sl"]
                 tp = pos["tp"]
 
-                # Move to Break-Even when trade reaches 50% toward TP
-                if ticket not in be_moved_tickets and tp > 0 and sl > 0:
-                    if direction == "BUY":
-                        target_dist = tp - entry_p
-                        current_gain = current_p - entry_p
-                        if current_gain >= target_dist * 0.50 and sl < entry_p:
-                            new_sl = entry_p + (sym_info.spread_usd or 0.20)
-                            if mt5_bridge.modify_position_sl(ticket, new_sl):
-                                be_moved_tickets.add(ticket)
-                                print(f"🔒 [PROFIT SHIELD] BUY Order #{ticket} SL locked to Break-Even at ${new_sl:.2f}!", flush=True)
+                pos_state = trailing_tracker.setdefault(ticket, {"tier": 0, "highest_sl": sl})
 
-                    elif direction == "SELL":
-                        target_dist = entry_p - tp
-                        current_gain = entry_p - current_p
-                        if current_gain >= target_dist * 0.50 and sl > entry_p:
-                            new_sl = entry_p - (sym_info.spread_usd or 0.20)
-                            if mt5_bridge.modify_position_sl(ticket, new_sl):
-                                be_moved_tickets.add(ticket)
-                                print(f"🔒 [PROFIT SHIELD] SELL Order #{ticket} SL locked to Break-Even at ${new_sl:.2f}!", flush=True)
+                if direction == "BUY":
+                    gain = current_p - entry_p
 
-            # 2. Check deals closed during this live session
+                    # Tier 1: Risk-Free Break-Even + Spread + Commission Buffer (+$1.10 Gain)
+                    if gain >= 1.10 and pos_state["tier"] < 1:
+                        target_sl = entry_p + spread + 0.15
+                        if target_sl > sl:
+                            if mt5_bridge.modify_position_sl(ticket, target_sl):
+                                pos_state["tier"] = 1
+                                pos_state["highest_sl"] = target_sl
+                                print(f"🔒 [PROFIT SHIELD: TIER 1] BUY #{ticket} moved to Risk-Free Break-Even + Spread Cushion at ${target_sl:.2f} (+${spread+0.15:.2f} locked, Gain: +${gain:.2f})", flush=True)
+
+                    # Tier 2: Guaranteed Profit Lock (+$1.80 Gain)
+                    elif gain >= 1.80 and pos_state["tier"] < 2:
+                        target_sl = entry_p + 0.90
+                        if target_sl > pos_state["highest_sl"]:
+                            if mt5_bridge.modify_position_sl(ticket, target_sl):
+                                pos_state["tier"] = 2
+                                pos_state["highest_sl"] = target_sl
+                                print(f"💰 [PROFIT SHIELD: TIER 2] BUY #{ticket} locked to +$0.90 Guaranteed Profit at ${target_sl:.2f}! (Gain: +${gain:.2f})", flush=True)
+
+                    # Tier 3: Dynamic Trailing Step (+$2.20+ Gain towards TP)
+                    elif gain >= 2.20:
+                        trail_sl = round(current_p - 0.70, 2)
+                        if trail_sl >= pos_state["highest_sl"] + 0.15:
+                            if mt5_bridge.modify_position_sl(ticket, trail_sl):
+                                pos_state["tier"] = 3
+                                pos_state["highest_sl"] = trail_sl
+                                print(f"📈 [DYNAMIC TRAIL: TIER 3] BUY #{ticket} Trailing SL stepped up to ${trail_sl:.2f} (Locking +${trail_sl - entry_p:.2f})", flush=True)
+
+                elif direction == "SELL":
+                    gain = entry_p - current_p
+
+                    # Tier 1: Risk-Free Break-Even + Spread + Commission Buffer (+$1.10 Gain)
+                    if gain >= 1.10 and pos_state["tier"] < 1:
+                        target_sl = entry_p - (spread + 0.15)
+                        if target_sl < sl or sl == 0:
+                            if mt5_bridge.modify_position_sl(ticket, target_sl):
+                                pos_state["tier"] = 1
+                                pos_state["highest_sl"] = target_sl
+                                print(f"🔒 [PROFIT SHIELD: TIER 1] SELL #{ticket} moved to Risk-Free Break-Even + Spread Cushion at ${target_sl:.2f} (+${spread+0.15:.2f} locked, Gain: +${gain:.2f})", flush=True)
+
+                    # Tier 2: Guaranteed Profit Lock (+$1.80 Gain)
+                    elif gain >= 1.80 and pos_state["tier"] < 2:
+                        target_sl = entry_p - 0.90
+                        if target_sl < pos_state["highest_sl"]:
+                            if mt5_bridge.modify_position_sl(ticket, target_sl):
+                                pos_state["tier"] = 2
+                                pos_state["highest_sl"] = target_sl
+                                print(f"💰 [PROFIT SHIELD: TIER 2] SELL #{ticket} locked to +$0.90 Guaranteed Profit at ${target_sl:.2f}! (Gain: +${gain:.2f})", flush=True)
+
+                    # Tier 3: Dynamic Trailing Step (+$2.20+ Gain towards TP)
+                    elif gain >= 2.20:
+                        trail_sl = round(current_p + 0.70, 2)
+                        if trail_sl <= pos_state["highest_sl"] - 0.15:
+                            if mt5_bridge.modify_position_sl(ticket, trail_sl):
+                                pos_state["tier"] = 3
+                                pos_state["highest_sl"] = trail_sl
+                                print(f"📈 [DYNAMIC TRAIL: TIER 3] SELL #{ticket} Trailing SL stepped down to ${trail_sl:.2f} (Locking +${entry_p - trail_sl:.2f})", flush=True)
+
+            # 2. Check deals closed today (anchored to 00:00:00 UTC)
+            today_realized_pnl = 0.0
             if hasattr(mt5_bridge, "get_closed_deals"):
-                closed_deals = mt5_bridge.get_closed_deals(from_timestamp=start_session_time)
+                today_midnight_utc = int(datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
+                closed_deals = mt5_bridge.get_closed_deals(from_timestamp=today_midnight_utc)
                 for deal in closed_deals:
                     ticket = deal["ticket"]
+                    pnl = deal["profit"]
+                    today_realized_pnl += pnl
+
                     if ticket not in processed_deal_tickets:
                         processed_deal_tickets.add(ticket)
-                        pnl = deal["profit"]
                         exit_p = deal["close_price"]
                         storage.update_closed_trade(ticket, exit_p, pnl, exit_reason="MT5 Deal Closed")
                         cb_manager.record_trade_outcome(net_pnl_usd=pnl, current_balance=acc.balance)
@@ -152,10 +206,10 @@ def run_live_auto_trading():
                             if session_consecutive_losses >= 2:
                                 print(f"🛑 [CIRCUIT PAUSE] {session_consecutive_losses} consecutive losses detected! Market appears choppy/whipsawing. Bot is PAUSING for 45 minutes to protect capital.", flush=True)
                             else:
-                                print(f"⚠️ [TRADE CLOSED - LOSS] Deal #{ticket} closed at -${abs(pnl):.2f}. Session PnL: ${session_realized_pnl:+.2f}. Cooling down for 5 mins.", flush=True)
+                                print(f"⚠️ [TRADE CLOSED - LOSS] Deal #{ticket} closed at -${abs(pnl):.2f}. Today's Net PnL: ${today_realized_pnl:+.2f}. Cooling down for 5 mins.", flush=True)
                         else:
                             session_consecutive_losses = 0
-                            print(f"🎉 [TRADE CLOSED - WIN] Deal #{ticket} closed at +${pnl:.2f} profit! Session PnL: ${session_realized_pnl:+.2f}", flush=True)
+                            print(f"🎉 [TRADE CLOSED - WIN] Deal #{ticket} closed at +${pnl:.2f} profit! Today's Net PnL: ${today_realized_pnl:+.2f}", flush=True)
 
             # 3. Fetch live M1 bars
             bars = mt5_bridge.get_rates(count=150)
@@ -212,7 +266,7 @@ def run_live_auto_trading():
                 news_disp = "🚨 FREEZE ACTIVE (" + news_stat_msg + ")" if is_news_f else "🟢 CLEAR"
 
                 print(
-                    f"\n🕯️ [{now_str} UTC | M1 CLOSE] Price: ${closes[-1]:.2f} | ATR: ${curr_atr:.2f} | PnL: ${session_realized_pnl:+.2f} | Session: {killzone_name}\n"
+                    f"\n🕯️ [{now_str} UTC | M1 CLOSE] Price: ${closes[-1]:.2f} | ATR: ${curr_atr:.2f} | Today PnL: ${today_realized_pnl:+.2f} (Goal: ${daily_profit_target_usd:.2f}) | Session: {killzone_name}\n"
                     f"   ├─ 🧭 M15 Trend: {htf_trend} ({htf_reason})\n"
                     f"   ├─ 📰 News Shield: {news_disp}\n"
                     f"   ├─ 🟢 BUY Setup ({buy_passed_count}/5): VWAP={long_st.vwap_pass} | Cross={long_st.crossover_pass} | OB={long_st.ob_pass} | Pullback={long_st.pullback_pass} | Candle={long_st.confirmation_pass}\n"
@@ -223,11 +277,12 @@ def run_live_auto_trading():
 
             # ================= STRICT RISK SHIELDS =================
 
-            # Shield 0: Daily Profit Target Lock (Protects Banked Profits)
-            if enable_daily_profit_lock and session_realized_pnl >= daily_profit_target_usd:
+            # Shield 0: Daily Profit Target Lock (Protects Banked Profits at $10.00 Goal)
+            effective_daily_pnl = max(session_realized_pnl, today_realized_pnl)
+            if enable_daily_profit_lock and effective_daily_pnl >= daily_profit_target_usd:
                 if (time.time() - last_target_print_time) > 300:
                     last_target_print_time = time.time()
-                    print(f"🏆 [DAILY TARGET LOCKED] Session Net Profit (+${session_realized_pnl:.2f}) reached goal of ${daily_profit_target_usd:.2f}! Trading locked for today to protect capital.", flush=True)
+                    print(f"🏆 [DAILY TARGET LOCKED] Today's Net Profit (+${effective_daily_pnl:.2f}) reached goal of ${daily_profit_target_usd:.2f}! Trading locked for today to protect capital.", flush=True)
                 continue
 
             # Shield 1: Single Active Position Guard
@@ -249,8 +304,11 @@ def run_live_auto_trading():
             if curr_atr < 0.70:
                 continue
 
-            # Shield 4: Session Killzone Filter (Optional)
+            # Shield 4: Golden Trading Session Filter (London 05:00-09:30 UTC & US 16:00-20:30 UTC)
             if params.enable_session_filter and not in_killzone:
+                if (time.time() - last_session_print_time) > 600:
+                    last_session_print_time = time.time()
+                    print(f"⏸️ [SESSION REST] {session_name}. Active Golden Windows: 05:00-09:30 UTC (London) & 16:00-20:30 UTC (US Flow). Bot resting safely.", flush=True)
                 continue
 
             # Shield 4b: High-Risk Whipsaw Hours Shield (10:00-15:00 UTC US Open / London Close chop)
