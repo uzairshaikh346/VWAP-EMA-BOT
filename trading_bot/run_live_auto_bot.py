@@ -93,7 +93,7 @@ def run_live_auto_trading():
     last_session_print_time = 0
     start_session_time = int(time.time())
     processed_deal_tickets = set()
-    trailing_tracker: Dict[int, Dict[str, Any]] = {}
+    be_moved_tickets = set()
 
     session_realized_pnl = 0.0
     session_consecutive_losses = 0
@@ -102,16 +102,10 @@ def run_live_auto_trading():
         while True:
             time.sleep(3)
 
-            # 1. Fetch live open positions and apply 3-Tier Smart Trailing SL with Spread Cushion
+            # 1. Fetch live open positions and apply 70% Break-Even with Spread Cushion
             open_positions = mt5_bridge.get_open_positions()
             sym_info = mt5_bridge.get_symbol_info()
             spread = max(0.20, min(0.60, float(sym_info.spread_usd or 0.25))) if sym_info else 0.25
-
-            # Cleanup closed tickets from tracking map
-            active_tickets = {p["ticket"] for p in open_positions}
-            for t in list(trailing_tracker.keys()):
-                if t not in active_tickets:
-                    del trailing_tracker[t]
 
             for pos in open_positions:
                 ticket = pos["ticket"]
@@ -121,67 +115,25 @@ def run_live_auto_trading():
                 sl = pos["sl"]
                 tp = pos["tp"]
 
-                pos_state = trailing_tracker.setdefault(ticket, {"tier": 0, "highest_sl": sl})
+                # Move to Break-Even ONLY when trade reaches 70% toward TP (Gives full breathing room!)
+                if ticket not in be_moved_tickets and tp > 0 and sl > 0:
+                    if direction == "BUY":
+                        target_dist = tp - entry_p
+                        current_gain = current_p - entry_p
+                        if current_gain >= target_dist * 0.70 and sl < entry_p:
+                            new_sl = round(entry_p + spread + 0.10, 2)
+                            if mt5_bridge.modify_position_sl(ticket, new_sl):
+                                be_moved_tickets.add(ticket)
+                                print(f"🔒 [BREAK-EVEN SHIELD] BUY Order #{ticket} reached 70% toward TP (+${current_gain:.2f})! SL locked to Entry + Spread Cushion (${new_sl:.2f}). Trade is 100% Risk-Free!", flush=True)
 
-                if direction == "BUY":
-                    gain = current_p - entry_p
-
-                    # Tier 1: Risk-Free Break-Even + Spread + Commission Buffer (+$1.10 Gain)
-                    if gain >= 1.10 and pos_state["tier"] < 1:
-                        target_sl = entry_p + spread + 0.15
-                        if target_sl > sl:
-                            if mt5_bridge.modify_position_sl(ticket, target_sl):
-                                pos_state["tier"] = 1
-                                pos_state["highest_sl"] = target_sl
-                                print(f"🔒 [PROFIT SHIELD: TIER 1] BUY #{ticket} moved to Risk-Free Break-Even + Spread Cushion at ${target_sl:.2f} (+${spread+0.15:.2f} locked, Gain: +${gain:.2f})", flush=True)
-
-                    # Tier 2: Guaranteed Profit Lock (+$1.80 Gain)
-                    elif gain >= 1.80 and pos_state["tier"] < 2:
-                        target_sl = entry_p + 0.90
-                        if target_sl > pos_state["highest_sl"]:
-                            if mt5_bridge.modify_position_sl(ticket, target_sl):
-                                pos_state["tier"] = 2
-                                pos_state["highest_sl"] = target_sl
-                                print(f"💰 [PROFIT SHIELD: TIER 2] BUY #{ticket} locked to +$0.90 Guaranteed Profit at ${target_sl:.2f}! (Gain: +${gain:.2f})", flush=True)
-
-                    # Tier 3: Dynamic Trailing Step (+$2.20+ Gain towards TP)
-                    elif gain >= 2.20:
-                        trail_sl = round(current_p - 0.70, 2)
-                        if trail_sl >= pos_state["highest_sl"] + 0.15:
-                            if mt5_bridge.modify_position_sl(ticket, trail_sl):
-                                pos_state["tier"] = 3
-                                pos_state["highest_sl"] = trail_sl
-                                print(f"📈 [DYNAMIC TRAIL: TIER 3] BUY #{ticket} Trailing SL stepped up to ${trail_sl:.2f} (Locking +${trail_sl - entry_p:.2f})", flush=True)
-
-                elif direction == "SELL":
-                    gain = entry_p - current_p
-
-                    # Tier 1: Risk-Free Break-Even + Spread + Commission Buffer (+$1.10 Gain)
-                    if gain >= 1.10 and pos_state["tier"] < 1:
-                        target_sl = entry_p - (spread + 0.15)
-                        if target_sl < sl or sl == 0:
-                            if mt5_bridge.modify_position_sl(ticket, target_sl):
-                                pos_state["tier"] = 1
-                                pos_state["highest_sl"] = target_sl
-                                print(f"🔒 [PROFIT SHIELD: TIER 1] SELL #{ticket} moved to Risk-Free Break-Even + Spread Cushion at ${target_sl:.2f} (+${spread+0.15:.2f} locked, Gain: +${gain:.2f})", flush=True)
-
-                    # Tier 2: Guaranteed Profit Lock (+$1.80 Gain)
-                    elif gain >= 1.80 and pos_state["tier"] < 2:
-                        target_sl = entry_p - 0.90
-                        if target_sl < pos_state["highest_sl"]:
-                            if mt5_bridge.modify_position_sl(ticket, target_sl):
-                                pos_state["tier"] = 2
-                                pos_state["highest_sl"] = target_sl
-                                print(f"💰 [PROFIT SHIELD: TIER 2] SELL #{ticket} locked to +$0.90 Guaranteed Profit at ${target_sl:.2f}! (Gain: +${gain:.2f})", flush=True)
-
-                    # Tier 3: Dynamic Trailing Step (+$2.20+ Gain towards TP)
-                    elif gain >= 2.20:
-                        trail_sl = round(current_p + 0.70, 2)
-                        if trail_sl <= pos_state["highest_sl"] - 0.15:
-                            if mt5_bridge.modify_position_sl(ticket, trail_sl):
-                                pos_state["tier"] = 3
-                                pos_state["highest_sl"] = trail_sl
-                                print(f"📈 [DYNAMIC TRAIL: TIER 3] SELL #{ticket} Trailing SL stepped down to ${trail_sl:.2f} (Locking +${entry_p - trail_sl:.2f})", flush=True)
+                    elif direction == "SELL":
+                        target_dist = entry_p - tp
+                        current_gain = entry_p - current_p
+                        if current_gain >= target_dist * 0.70 and (sl > entry_p or sl == 0):
+                            new_sl = round(entry_p - (spread + 0.10), 2)
+                            if mt5_bridge.modify_position_sl(ticket, new_sl):
+                                be_moved_tickets.add(ticket)
+                                print(f"🔒 [BREAK-EVEN SHIELD] SELL Order #{ticket} reached 70% toward TP (+${current_gain:.2f})! SL locked to Entry - Spread Cushion (${new_sl:.2f}). Trade is 100% Risk-Free!", flush=True)
 
             # 2. Check deals closed today (anchored to 00:00:00 UTC)
             today_realized_pnl = 0.0
