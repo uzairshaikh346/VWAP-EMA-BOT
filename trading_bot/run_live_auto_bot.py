@@ -24,6 +24,7 @@ from trading_bot.strategy import (
     evaluate_checklist_at_bar,
     calculate_sl_tp,
     calculate_atr,
+    calculate_adx,
     evaluate_htf_trend,
     is_in_killzone
 )
@@ -203,6 +204,9 @@ def run_live_auto_trading():
             atr_vals = calculate_atr(highs, lows, closes, period=14)
             curr_atr = atr_vals[-1] if atr_vals else 1.0
 
+            adx_vals = calculate_adx(highs, lows, closes, period=params.adx_period)
+            curr_adx = adx_vals[-1] if adx_vals else 25.0
+
             now_str = datetime.now(timezone.utc).strftime("%H:%M:%S")
 
             # 7. Print Diagnostic Output on M1 Candle Close
@@ -218,7 +222,7 @@ def run_live_auto_trading():
                 news_disp = "🚨 FREEZE ACTIVE (" + news_stat_msg + ")" if is_news_f else "🟢 CLEAR"
 
                 print(
-                    f"\n🕯️ [{now_str} UTC | M1 CLOSE] Price: ${closes[-1]:.2f} | ATR: ${curr_atr:.2f} | Today PnL: ${today_realized_pnl:+.2f} (Goal: ${daily_profit_target_usd:.2f}) | Session: {killzone_name}\n"
+                    f"\n🕯️ [{now_str} UTC | M1 CLOSE] Price: ${closes[-1]:.2f} | ATR: ${curr_atr:.2f} | ADX: {curr_adx:.1f} | Today PnL: ${today_realized_pnl:+.2f} (Goal: ${daily_profit_target_usd:.2f}) | Session: {killzone_name}\n"
                     f"   ├─ 🧭 M15 Trend: {htf_trend} ({htf_reason})\n"
                     f"   ├─ 📰 News Shield: {news_disp}\n"
                     f"   ├─ 🟢 BUY Setup ({buy_passed_count}/5): VWAP={long_st.vwap_pass} | Cross={long_st.crossover_pass} | OB={long_st.ob_pass} | Pullback={long_st.pullback_pass} | Candle={long_st.confirmation_pass}\n"
@@ -266,7 +270,7 @@ def run_live_auto_trading():
             # Shield 4b: High-Risk Whipsaw Hours Shield (10:00-15:00 UTC US Open / London Close chop)
             if getattr(params, "avoid_toxic_hours", True):
                 current_utc_hour = datetime.now(timezone.utc).hour
-                if current_utc_hour in [10, 12, 13, 14, 15]:
+                if current_utc_hour in [10, 11, 12, 13, 14, 15]:
                     if (time.time() - last_toxic_print_time) > 600:
                         last_toxic_print_time = time.time()
                         print(f"⏸️ [CHOP SHIELD] Hour {current_utc_hour:02d}:00 UTC is in the High-Risk Whipsaw Zone (historical -$180 loss window). Pausing entries until clean market flow.", flush=True)

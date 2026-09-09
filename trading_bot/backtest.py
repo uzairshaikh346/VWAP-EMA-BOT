@@ -20,7 +20,8 @@ from trading_bot.strategy import (
     evaluate_checklist_at_bar,
     calculate_ema,
     calculate_session_vwap,
-    calculate_atr
+    calculate_atr,
+    calculate_adx
 )
 
 
@@ -298,12 +299,14 @@ def run_causal_backtest(
     ema21 = calculate_ema(closes, params.ema_slow_period)
     vwap = calculate_session_vwap(times, highs, lows, closes, volumes, params.vwap_anchor_hour_utc)
     atr = calculate_atr(highs, lows, closes, params.atr_period)
+    adx = calculate_adx(highs, lows, closes, params.adx_period)
 
     cached_ind = {
         "ema9": ema9,
         "ema21": ema21,
         "vwap": vwap,
-        "atr": atr
+        "atr": atr,
+        "adx": adx
     }
 
     split_idx = int(n * split_ratio)

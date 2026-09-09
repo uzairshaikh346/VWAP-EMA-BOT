@@ -6,6 +6,7 @@ import unittest
 from trading_bot.strategy import (
     calculate_ema,
     calculate_atr,
+    calculate_adx,
     calculate_session_vwap,
     find_causal_swings,
     check_confirmation_candle,
@@ -111,6 +112,20 @@ class TestStrategyAndIndicators(unittest.TestCase):
         )
         self.assertTrue(passed)
         self.assertEqual(name, "Bearish Engulfing")
+
+    def test_adx_calculation(self):
+        """Test ADX calculation produces bounded values between 0 and 100."""
+        n = 50
+        highs = [100.0 + i * 0.5 + 1.0 for i in range(n)]
+        lows = [100.0 + i * 0.5 - 1.0 for i in range(n)]
+        closes = [100.0 + i * 0.5 for i in range(n)]
+        adx = calculate_adx(highs, lows, closes, period=14)
+        self.assertEqual(len(adx), n)
+        for val in adx:
+            self.assertGreaterEqual(val, 0.0)
+            self.assertLessEqual(val, 100.0)
+        # Strong directional trend should yield high ADX
+        self.assertGreater(adx[-1], 20.0)
 
 
 if __name__ == '__main__':
