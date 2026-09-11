@@ -64,9 +64,15 @@ class BotStorage:
                     pattern_name TEXT,
                     is_demo INTEGER DEFAULT 1,
                     magic_number INTEGER,
+                    session TEXT,
                     created_at TEXT NOT NULL
                 )
             """)
+
+            # Migration: add `session` column to trades tables created before it existed.
+            cols = [r[1] for r in cursor.execute("PRAGMA table_info(trades)").fetchall()]
+            if "session" not in cols:
+                cursor.execute("ALTER TABLE trades ADD COLUMN session TEXT")
 
             # 2. Settings table (key-value store)
             cursor.execute("""
@@ -101,8 +107,8 @@ class BotStorage:
                     ticket, direction, entry_time, entry_price, stop_loss, take_profit,
                     lot_size, exit_time, exit_price, exit_reason, net_pnl_usd,
                     pnl_r_multiple, spread_paid_usd, commission_paid_usd, pattern_name,
-                    is_demo, magic_number, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    is_demo, magic_number, session, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 trade_data.get("ticket") or trade_data.get("order_id"),
                 trade_data.get("direction"),
@@ -121,6 +127,7 @@ class BotStorage:
                 trade_data.get("pattern_name", ""),
                 1 if trade_data.get("is_demo", True) else 0,
                 trade_data.get("magic_number", 9212001),
+                trade_data.get("session"),
                 now
             ))
             conn.commit()

@@ -852,6 +852,34 @@ def is_in_killzone(utc_dt: Optional[datetime] = None) -> Tuple[bool, str]:
     return False, "Outside Golden Hours (Avoidance Zone - Resting safely)"
 
 
+def classify_session(utc_dt: Optional[datetime] = None) -> Tuple[str, str]:
+    """
+    Classifies the current UTC time into a forex trading session bucket so trades
+    can be tagged and analysed per-session afterwards.
+
+    Buckets (UTC boundaries):
+      ASIA      00:00-07:59  (Tokyo / Sydney)                     Karachi 05:00-12:59
+      LONDON    08:00-12:59  (London open, before NY)             Karachi 13:00-17:59
+      OVERLAP   13:00-15:59  (London / New York overlap)          Karachi 18:00-20:59
+      NEWYORK   16:00-21:59  (New York afternoon, London closed)  Karachi 21:00-02:59
+      LATE      22:00-23:59  (NY close / Sydney open rollover)    Karachi 03:00-04:59
+
+    Returns (session_code, human_label).
+    """
+    now = utc_dt or datetime.now(timezone.utc)
+    hour = now.hour
+
+    if 0 <= hour < 8:
+        return "ASIA", "Asian Session (00:00-08:00 UTC)"
+    if 8 <= hour < 13:
+        return "LONDON", "London Session (08:00-13:00 UTC)"
+    if 13 <= hour < 16:
+        return "OVERLAP", "London/NY Overlap (13:00-16:00 UTC)"
+    if 16 <= hour < 22:
+        return "NEWYORK", "New York Session (16:00-22:00 UTC)"
+    return "LATE", "Late / Rollover (22:00-00:00 UTC)"
+
+
 def evaluate_htf_trend(
     htf_closes: List[float],
     period: int = 50
