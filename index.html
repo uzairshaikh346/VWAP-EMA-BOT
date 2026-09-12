@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>XAU/USD Triple Filter Scalper MT5</title>
+    <meta name="description" content="Streamlit + MetaTrader5 desktop trading bot for XAU/USD 1m Triple Filter EMA 9/21 + VWAP Scalping with Order Blocks, Causal Backtest Engine, and Monte Carlo Noise-Control Gate." />
+    <meta property="og:title" content="XAU/USD Triple Filter Scalper MT5" />
+    <meta property="og:description" content="Streamlit + MetaTrader5 desktop trading bot for XAU/USD 1m Triple Filter EMA 9/21 + VWAP Scalping with Order Blocks, Causal Backtest Engine, and Monte Carlo Noise-Control Gate." />
+    <meta property="og:type" content="website" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <script>
+      (function () {
+        try {
+          var _origFetch = window.fetch;
+          var _currentFetch = _origFetch;
+          try {
+            Object.defineProperty(window, 'fetch', {
+              get: function () {
+                return _currentFetch;
+              },
+              set: function (fn) {
+                _currentFetch = fn;
+              },
+              configurable: true,
+              enumerable: true,
+            });
+          } catch (e1) {
+            try {
+              var proto = Object.getPrototypeOf(window);
+              if (proto) {
+                Object.defineProperty(proto, 'fetch', {
+                  get: function () {
+                    return _currentFetch;
+                  },
+                  set: function (fn) {
+                    _currentFetch = fn;
+                  },
+                  configurable: true,
+                  enumerable: true,
+                });
+              }
+            } catch (e2) {}
+          }
+        } catch (err) {}
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
+
