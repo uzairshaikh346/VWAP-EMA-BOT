@@ -1,0 +1,6 @@
+{
+  "name": "XAU/USD Triple Filter Scalper MT5",
+  "description": "Streamlit + MetaTrader5 desktop trading bot for XAU/USD 1m Triple Filter EMA 9/21 + VWAP Scalping with Order Blocks, Causal Backtest Engine, and Monte Carlo Noise-Control Gate.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
