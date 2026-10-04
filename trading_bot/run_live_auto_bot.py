@@ -67,21 +67,31 @@ def run_live_auto_trading(
     daily_max_loss: float = 0.0,
     max_daily_trades: int = 0,
     max_session_losses: int = 0,
-    atr_mult: float = 1.5,
+    atr_mult: float = 2.0,
     min_sl: float = 0.0,
     max_ema_gap: float = 0.0,
     max_candle_range: float = 0.0,
+    breakeven_atr: float = 0.0,
+    use_200_ema: bool = False,
     trigger_mode: str = "ema_cross",
-    lot: float = 0.02
+    lot: float = 0.02,
+    mt5_path: Optional[str] = None,
+    magic_number: int = 9050201
 ):
     print("=" * 95, flush=True)
     print("🚀 STARTING LIVE AUTONOMOUS ENGINE: EMA9 + VWAP CROSS STRATEGY (GOLD SCALPING)", flush=True)
-    print(f"📊 Instrument: {symbol} | Timeframe: M5 | Lot Size: {lot} | Contract: 100 oz", flush=True)
+    print(f"📊 Instrument: {symbol} | Timeframe: M5 | Lot Size: {lot} | Magic: {magic_number}", flush=True)
+    if mt5_path:
+        print(f"🖥️ Targeted MT5 Terminal: {mt5_path}", flush=True)
     trigger_desc = "Candle crosses VWAP (Aligned with EMA9)" if trigger_mode == "candle_vwap_cross" else "9 EMA crosses VWAP (Aligned with Candle)"
     print(f"🎯 Entry Mode: {trigger_desc}", flush=True)
     print("⏰ Trading Sessions: Asian (00:00–08:00) + London (12:00–17:00) Server Time", flush=True)
     sl_desc = f"{atr_mult} x ATR(14)" if min_sl == 0 else f"{atr_mult} x ATR(14) (Min SL: ${min_sl:.2f})"
     print(f"🛡️ Exits: Hard SL = {sl_desc} | Trend Reversal Exit = 20% candle range beyond EMA9", flush=True)
+    if use_200_ema:
+        print(f"📈 200 EMA Macro Filter: ON (Buys strictly above 200 EMA, Sells strictly below)", flush=True)
+    if breakeven_atr > 0:
+        print(f"🛡️ Breakeven Level: +{breakeven_atr:.1f} x ATR Profit (Moves SL to Entry + Spread)", flush=True)
     if max_ema_gap > 0:
         print(f"🛑 Max EMA Gap Filter: {max_ema_gap:.2f} x ATR (Skips overextended entries)", flush=True)
     if max_candle_range > 0:
@@ -95,7 +105,7 @@ def run_live_auto_trading(
     print("=" * 95, flush=True)
 
     storage = BotStorage()
-    mt5_bridge = MT5Bridge(symbol=symbol, magic_number=9050201)
+    mt5_bridge = MT5Bridge(symbol=symbol, magic_number=magic_number)
 
     news_filter = EconomicNewsFilter(target_currencies=["USD"], freeze_before_mins=30, freeze_after_mins=30)
     if enable_news_shield:
@@ -110,7 +120,7 @@ def run_live_auto_trading(
         except Exception as e:
             print(f"⚠️ Could not load news calendar ({e}); running with price-action safety.", flush=True)
 
-    ok, conn_msg = mt5_bridge.connect()
+    ok, conn_msg = mt5_bridge.connect(path=mt5_path if mt5_path else None)
     if not ok:
         print(f"❌ Could not connect to MetaTrader 5 terminal: {conn_msg}", flush=True)
         return
@@ -190,6 +200,7 @@ def run_live_auto_trading(
             ema9_vals = calculate_ema(closes, period=9)
             vwap_vals = calculate_session_vwap(times, highs, lows, closes, volumes, anchor_hour_utc=0)
             atr_vals = calculate_atr(highs, lows, closes, period=14)
+            ema200_vals = calculate_ema(closes, period=200)
 
             # Current completed bar is the penultimate bar [-2] if last is still building, or [-1]
             # In live MT5 rates, [-1] is currently forming bar, [-2] is last closed candle.
@@ -217,6 +228,7 @@ def run_live_auto_trading(
             c_ema9 = ema9_vals[completed_idx]
             c_vwap = vwap_vals[completed_idx]
             c_atr = atr_vals[completed_idx]
+            c_ema200 = ema200_vals[completed_idx]
 
             # 4. Check if a new M5 candle has closed
             is_new_candle = (completed_time != last_evaluated_bar_time)
@@ -266,6 +278,29 @@ def run_live_auto_trading(
 
                 # Refresh open positions after potential exit
                 open_positions = mt5_bridge.get_open_positions()
+
+                # 5b. Evaluate Breakeven SL Update on active positions
+                if breakeven_atr > 0 and open_positions:
+                    for pos in open_positions:
+                        pos_ticket = pos["ticket"]
+                        pos_dir = pos["direction"]
+                        entry_p = pos["entry_price"]
+                        current_sl = pos.get("sl", 0.0)
+
+                        if pos_dir == "BUY":
+                            be_trigger = entry_p + (breakeven_atr * c_atr)
+                            target_be_sl = round(entry_p + 0.25, 2)
+                            if c_high >= be_trigger and current_sl < target_be_sl:
+                                ok_mod = mt5_bridge.modify_position_sl(pos_ticket, target_be_sl)
+                                if ok_mod:
+                                    print(f"🛡️ [BREAKEVEN TRIGGERED] Buy #{pos_ticket} reached +{breakeven_atr:.1f}x ATR (${be_trigger:.2f})! SL moved to Breakeven (+Spread): ${target_be_sl:.2f}", flush=True)
+                        elif pos_dir == "SELL":
+                            be_trigger = entry_p - (breakeven_atr * c_atr)
+                            target_be_sl = round(entry_p - 0.25, 2)
+                            if c_low <= be_trigger and (current_sl == 0.0 or current_sl > target_be_sl):
+                                ok_mod = mt5_bridge.modify_position_sl(pos_ticket, target_be_sl)
+                                if ok_mod:
+                                    print(f"🛡️ [BREAKEVEN TRIGGERED] Sell #{pos_ticket} reached +{breakeven_atr:.1f}x ATR (${be_trigger:.2f})! SL moved to Breakeven (+Spread): ${target_be_sl:.2f}", flush=True)
 
                 # =========================================================
                 # 6. EVALUATE NEW ENTRY RULES (IF NO POSITION OPEN)
@@ -326,6 +361,14 @@ def run_live_auto_trading(
                     else:
                         is_buy = (prev_ema9 <= prev_vwap) and (c_ema9 > c_vwap) and (c_close > c_ema9)
                         is_sell = (prev_ema9 >= prev_vwap) and (c_ema9 < c_vwap) and (c_close < c_ema9)
+
+                    # Check 200 EMA Macro Trend Filter
+                    if use_200_ema and is_buy and (c_close <= c_ema200):
+                        print(f"⚠️ [200 EMA BLOCKED] Buy signal skipped: Close (${c_close:.2f}) <= 200 EMA (${c_ema200:.2f})", flush=True)
+                        is_buy = False
+                    if use_200_ema and is_sell and (c_close >= c_ema200):
+                        print(f"⚠️ [200 EMA BLOCKED] Sell signal skipped: Close (${c_close:.2f}) >= 200 EMA (${c_ema200:.2f})", flush=True)
+                        is_sell = False
 
                     if is_buy:
                         sl_dist = max(min_sl, atr_mult * c_atr)
@@ -413,13 +456,17 @@ if __name__ == "__main__":
     parser.add_argument("--daily-max-loss", type=float, default=0.0, help="Daily Max Loss Block in USD (default 0.0 = disabled, set e.g. 25.0 to enable)")
     parser.add_argument("--max-daily-trades", type=int, default=0, help="Max trades allowed per day (e.g. 3, 0 = unlimited)")
     parser.add_argument("--max-session-losses", type=int, default=0, help="Max consecutive losses before pausing current session (e.g. 2, 0 = unlimited)")
-    parser.add_argument("--atr-mult", type=float, default=1.5, help="ATR SL multiplier (default 1.5, can test 1.75 or 2.0)")
+    parser.add_argument("--atr-mult", type=float, default=2.0, help="ATR SL multiplier (default 2.0, e.g. 1.5 or 2.0)")
     parser.add_argument("--min-sl", type=float, default=0.0, help="Minimum Stop Loss in USD (default 0.0, e.g. 2.5)")
     parser.add_argument("--max-ema-gap", type=float, default=0.0, help="Max allowed gap between Close and EMA9 in ATR units (e.g. 0.8 or 1.0, default 0.0 = disabled)")
     parser.add_argument("--max-candle-range", type=float, default=0.0, help="Max trigger candle range in ATR units (e.g. 1.8 or 2.0, default 0.0 = disabled)")
+    parser.add_argument("--breakeven-atr", type=float, default=0.0, help="Move SL to Breakeven (+Spread) once profit reaches N x ATR (e.g. 1.5 or 2.0, default 0.0 = disabled)")
+    parser.add_argument("--use-200-ema", action="store_true", help="Filter trades with 200 EMA (Buys above 200 EMA, Sells below 200 EMA)")
     parser.add_argument("--trigger-mode", type=str, choices=["ema_cross", "candle_vwap_cross"], default="ema_cross", help="Trigger mode: 'ema_cross' (default) or 'candle_vwap_cross'")
     parser.add_argument("--candle-vwap-cross", action="store_true", help="Shortcut to run candle crosses VWAP while aligned with EMA9")
     parser.add_argument("--no-news", action="store_true", help="Disable economic news shield")
+    parser.add_argument("--mt5-path", type=str, default="", help="Path to specific MT5 terminal64.exe (e.g. 'C:\\Program Files\\MetaTrader 5 - Bot2\\terminal64.exe')")
+    parser.add_argument("--magic-number", type=int, default=9050201, help="Unique Magic Number for order tracking (default 9050201)")
     args = parser.parse_args()
 
     mode = "candle_vwap_cross" if args.candle_vwap_cross else args.trigger_mode
@@ -434,6 +481,10 @@ if __name__ == "__main__":
         min_sl=args.min_sl,
         max_ema_gap=args.max_ema_gap,
         max_candle_range=args.max_candle_range,
+        breakeven_atr=args.breakeven_atr,
+        use_200_ema=args.use_200_ema,
         trigger_mode=mode,
-        lot=args.lot
+        lot=args.lot,
+        mt5_path=args.mt5_path if args.mt5_path.strip() else None,
+        magic_number=args.magic_number
     )

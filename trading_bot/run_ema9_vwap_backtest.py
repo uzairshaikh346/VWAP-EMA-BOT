@@ -56,6 +56,7 @@ from trading_bot.strategy import (
     is_ema9_vwap_session_active,
     evaluate_trend_exit
 )
+from trading_bot.news_filter import EconomicNewsFilter
 
 
 def run_ema9_vwap_backtest(
@@ -66,9 +67,14 @@ def run_ema9_vwap_backtest(
     daily_max_loss: float = 0.0,
     max_daily_trades: int = 0,
     max_session_losses: int = 0,
-    atr_mult: float = 1.5,
+    atr_mult: float = 2.0,
     min_sl: float = 0.0,
-    max_ema_gap: float = 0.0
+    max_ema_gap: float = 0.0,
+    breakeven_atr: float = 0.0,
+    use_200_ema: bool = False,
+    enable_news_shield: bool = True,
+    news_freeze_mins: int = 30,
+    mt5_path: Optional[str] = None
 ):
     print("=" * 95, flush=True)
     print("  🏛️  EMA9 + VWAP CROSS STRATEGY (GOLD SCALPING ADAPTATION)", flush=True)
@@ -79,6 +85,14 @@ def run_ema9_vwap_backtest(
     print(f"  💰 Account Capital:         ${starting_balance:.2f} USD (Fixed Lot: {lot_size})", flush=True)
     sl_desc = f"{atr_mult} x ATR(14)" if min_sl == 0 else f"{atr_mult} x ATR(14) (Min SL: ${min_sl:.2f})"
     print(f"  🛡️ Protective SL:           {sl_desc} | Exit: 20% Candle Range Beyond EMA9", flush=True)
+    if enable_news_shield:
+        print(f"  📡 Economic News Shield:    ON (Freeze ±{news_freeze_mins}m around High-Impact USD News)", flush=True)
+    else:
+        print(f"  📡 Economic News Shield:    OFF (Disabled)", flush=True)
+    if use_200_ema:
+        print(f"  📈 200 EMA Macro Filter:    ON (Buys strictly above 200 EMA, Sells strictly below)", flush=True)
+    if breakeven_atr > 0:
+        print(f"  🎯 Breakeven Trigger:       At +{breakeven_atr:.1f} x ATR Profit (Moves SL to Entry + Spread)", flush=True)
     if max_ema_gap > 0:
         print(f"  🛑 Max EMA Gap Filter:      {max_ema_gap:.2f} x ATR (Skips overextended entries)", flush=True)
     if max_daily_trades > 0:
@@ -89,8 +103,14 @@ def run_ema9_vwap_backtest(
         print(f"  🛑 Daily SL Block / Shield: -${daily_max_loss:.2f} USD (Trading halted for the day if hit)", flush=True)
     print("===============================================================================================\n", flush=True)
 
+    news_filter = EconomicNewsFilter(
+        target_currencies=["USD"],
+        freeze_before_mins=news_freeze_mins,
+        freeze_after_mins=news_freeze_mins
+    )
+
     bridge = MT5Bridge(symbol=symbol)
-    connected, conn_msg = bridge.connect()
+    connected, conn_msg = bridge.connect(path=mt5_path if mt5_path else None)
     if not connected:
         print(f"❌ MT5 init failed: {conn_msg}", flush=True)
         return
@@ -123,6 +143,7 @@ def run_ema9_vwap_backtest(
     ema9_vals = calculate_ema(closes, period=9)
     vwap_vals = calculate_session_vwap(times, highs, lows, closes, volumes, anchor_hour_utc=0)
     atr_vals = calculate_atr(highs, lows, closes, period=14)
+    ema200_vals = calculate_ema(closes, period=200)
 
     # Simulation state
     balance = starting_balance
@@ -180,20 +201,38 @@ def run_ema9_vwap_backtest(
             direction = active_pos["direction"]
             entry_p = active_pos["entry_price"]
             sl_p = active_pos["sl"]
+            entry_atr = active_pos.get("entry_atr", c_atr)
             pos_closed = False
             exit_p = 0.0
             exit_reason = ""
 
-            # Check Hard Protective Stop-Loss
+            # Check Breakeven Protection: If favorable excursion reaches breakeven_atr * ATR, move SL to Entry + Spread
+            if breakeven_atr > 0 and not active_pos.get("be_active", False):
+                if direction == "BUY":
+                    if c_high >= (entry_p + breakeven_atr * entry_atr):
+                        be_sl = round(entry_p + spread_usd, 2)
+                        if be_sl > sl_p:
+                            active_pos["sl"] = be_sl
+                            sl_p = be_sl
+                            active_pos["be_active"] = True
+                elif direction == "SELL":
+                    if c_low <= (entry_p - breakeven_atr * entry_atr):
+                        be_sl = round(entry_p - spread_usd, 2)
+                        if be_sl < sl_p:
+                            active_pos["sl"] = be_sl
+                            sl_p = be_sl
+                            active_pos["be_active"] = True
+
+            # Check Hard Protective Stop-Loss (or Breakeven Stop)
             if direction == "BUY":
                 if c_low <= sl_p:
                     exit_p = sl_p
-                    exit_reason = f"Protective SL Hit ({atr_mult}x ATR)"
+                    exit_reason = "Breakeven (+Spread) Hit" if active_pos.get("be_active") else f"Protective SL Hit ({atr_mult}x ATR)"
                     pos_closed = True
             elif direction == "SELL":
                 if c_high >= sl_p:
                     exit_p = sl_p
-                    exit_reason = f"Protective SL Hit ({atr_mult}x ATR)"
+                    exit_reason = "Breakeven (+Spread) Hit" if active_pos.get("be_active") else f"Protective SL Hit ({atr_mult}x ATR)"
                     pos_closed = True
 
             # If SL not hit, check Trend Exit rule at candle close
@@ -281,6 +320,12 @@ def run_ema9_vwap_backtest(
                 if max_session_losses > 0 and session_loss_count >= max_session_losses:
                     continue
 
+                # Check Economic News Shield (Freezes entry during High-Impact USD News)
+                if enable_news_shield:
+                    is_frozen, news_reason, _ = news_filter.is_news_freeze_active(dt)
+                    if is_frozen:
+                        continue
+
                 prev_ema9 = ema9_vals[i - 1]
                 prev_vwap = vwap_vals[i - 1]
                 ema_gap = abs(c_close - c_ema9)
@@ -292,13 +337,16 @@ def run_ema9_vwap_backtest(
                 # Long (Buy) Entry:
                 # 1. 9 EMA crosses above VWAP
                 # 2. Candle Close > 9 EMA
-                if (prev_ema9 <= prev_vwap) and (c_ema9 > c_vwap) and (c_close > c_ema9):
+                # 3. If use_200_ema: Candle Close > 200 EMA
+                if (prev_ema9 <= prev_vwap) and (c_ema9 > c_vwap) and (c_close > c_ema9) and (not use_200_ema or c_close > ema200_vals[i]):
                     sl_dist = max(min_sl, atr_mult * c_atr)
                     sl = round(c_close - sl_dist, 2)
                     active_pos = {
                         "direction": "BUY",
                         "entry_price": c_close,
                         "sl": sl,
+                        "entry_atr": c_atr,
+                        "be_active": False,
                         "entry_time": dt.strftime("%Y-%m-%d %H:%M"),
                         "session": session_name
                     }
@@ -306,13 +354,16 @@ def run_ema9_vwap_backtest(
                 # Short (Sell) Entry:
                 # 1. 9 EMA crosses below VWAP
                 # 2. Candle Close < 9 EMA
-                elif (prev_ema9 >= prev_vwap) and (c_ema9 < c_vwap) and (c_close < c_ema9):
+                # 3. If use_200_ema: Candle Close < 200 EMA
+                elif (prev_ema9 >= prev_vwap) and (c_ema9 < c_vwap) and (c_close < c_ema9) and (not use_200_ema or c_close < ema200_vals[i]):
                     sl_dist = max(min_sl, atr_mult * c_atr)
                     sl = round(c_close + sl_dist, 2)
                     active_pos = {
                         "direction": "SELL",
                         "entry_price": c_close,
                         "sl": sl,
+                        "entry_atr": c_atr,
+                        "be_active": False,
                         "entry_time": dt.strftime("%Y-%m-%d %H:%M"),
                         "session": session_name
                     }
@@ -383,10 +434,14 @@ if __name__ == "__main__":
     parser.add_argument("--daily-max-loss", type=float, default=0.0, help="Daily Max Loss Block in USD (default 0.0 = disabled, set e.g. 25.0 to enable)")
     parser.add_argument("--max-daily-trades", type=int, default=0, help="Max trades allowed per day (e.g. 3, 0 = unlimited)")
     parser.add_argument("--max-session-losses", type=int, default=0, help="Max consecutive losses before pausing current session (e.g. 2, 0 = unlimited)")
-    parser.add_argument("--atr-mult", type=float, default=1.5, help="ATR SL multiplier (default 1.5, e.g. 1.75)")
+    parser.add_argument("--atr-mult", type=float, default=2.0, help="ATR SL multiplier (default 2.0, e.g. 1.5 or 2.0)")
     parser.add_argument("--min-sl", type=float, default=0.0, help="Minimum Stop Loss in USD (default 0.0, e.g. 2.5)")
     parser.add_argument("--max-ema-gap", type=float, default=0.0, help="Max allowed gap between Close and EMA9 in ATR units (e.g. 1.0 to skip overextensions, default 0.0 = disabled)")
-    parser.add_argument("--no-news", action="store_true", help="Disable economic news shield (accepted for CLI compatibility)")
+    parser.add_argument("--breakeven-atr", type=float, default=0.0, help="Move SL to Breakeven (+Spread) when profit reaches N x ATR (e.g. 1.5 or 2.0, default 0.0 = disabled)")
+    parser.add_argument("--use-200-ema", action="store_true", help="Filter entries with 200 EMA (Buys strictly above 200 EMA, Sells strictly below)")
+    parser.add_argument("--no-news", action="store_true", help="Disable economic news shield")
+    parser.add_argument("--news-freeze-mins", type=int, default=30, help="Minutes to freeze before and after high-impact USD events (default: 30)")
+    parser.add_argument("--mt5-path", type=str, default="", help="Path to specific MT5 terminal64.exe (e.g. 'C:\\Program Files\\MetaTrader 5 - Bot2\\terminal64.exe')")
     args = parser.parse_args()
 
     run_ema9_vwap_backtest(
@@ -399,5 +454,10 @@ if __name__ == "__main__":
         max_session_losses=args.max_session_losses,
         atr_mult=args.atr_mult,
         min_sl=args.min_sl,
-        max_ema_gap=args.max_ema_gap
+        max_ema_gap=args.max_ema_gap,
+        breakeven_atr=args.breakeven_atr,
+        use_200_ema=args.use_200_ema,
+        enable_news_shield=not args.no_news,
+        news_freeze_mins=args.news_freeze_mins,
+        mt5_path=args.mt5_path if args.mt5_path.strip() else None
     )
