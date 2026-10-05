@@ -76,13 +76,18 @@ def run_live_auto_trading(
     trigger_mode: str = "ema_cross",
     lot: float = 0.02,
     mt5_path: Optional[str] = None,
-    magic_number: int = 9050201
+    magic_number: int = 9050201,
+    login: Optional[int] = None,
+    server: Optional[str] = None,
+    password: Optional[str] = None
 ):
     print("=" * 95, flush=True)
     print("🚀 STARTING LIVE AUTONOMOUS ENGINE: EMA9 + VWAP CROSS STRATEGY (GOLD SCALPING)", flush=True)
     print(f"📊 Instrument: {symbol} | Timeframe: M5 | Lot Size: {lot} | Magic: {magic_number}", flush=True)
     if mt5_path:
         print(f"🖥️ Targeted MT5 Terminal: {mt5_path}", flush=True)
+    if login:
+        print(f"👤 Targeted Account: #{login} (Server: {server or 'Current'})", flush=True)
     trigger_desc = "Candle crosses VWAP (Aligned with EMA9)" if trigger_mode == "candle_vwap_cross" else "9 EMA crosses VWAP (Aligned with Candle)"
     print(f"🎯 Entry Mode: {trigger_desc}", flush=True)
     print("⏰ Trading Sessions: Asian (00:00–08:00) + London (12:00–17:00) Server Time", flush=True)
@@ -120,7 +125,12 @@ def run_live_auto_trading(
         except Exception as e:
             print(f"⚠️ Could not load news calendar ({e}); running with price-action safety.", flush=True)
 
-    ok, conn_msg = mt5_bridge.connect(path=mt5_path if mt5_path else None)
+    ok, conn_msg = mt5_bridge.connect(
+        path=mt5_path if mt5_path else None,
+        login=login,
+        server=server,
+        password=password
+    )
     if not ok:
         print(f"❌ Could not connect to MetaTrader 5 terminal: {conn_msg}", flush=True)
         return
@@ -171,7 +181,10 @@ def run_live_auto_trading(
                     if ticket not in processed_deal_tickets:
                         processed_deal_tickets.add(ticket)
                         exit_p = deal["close_price"]
-                        storage.update_closed_trade(ticket, exit_p, pnl, exit_reason="MT5 Deal Closed")
+                        try:
+                            storage.update_closed_trade(ticket, exit_p, pnl, exit_reason="MT5 Deal Closed")
+                        except Exception as e:
+                            print(f"⚠️ Storage update warning: {e}", flush=True)
                         if pnl >= 0:
                             session_consecutive_losses = 0
                             print(f"🎉 [TRADE CLOSED - WIN] Deal #{ticket} closed at +${pnl:.2f} profit! Today's Net: ${today_realized_pnl:+.2f}", flush=True)
@@ -272,7 +285,10 @@ def run_live_auto_trading(
                         closed_ok, msg = mt5_bridge.close_position(pos_ticket, comment="EMA9_TrendExit")
                         if closed_ok:
                             print(f"✅ {msg}\n", flush=True)
-                            storage.update_closed_trade(pos_ticket, c_close, 0.0, exit_reason=exit_reason)
+                            try:
+                                storage.update_closed_trade(pos_ticket, c_close, 0.0, exit_reason=exit_reason)
+                            except Exception as e:
+                                print(f"⚠️ Storage update warning: {e}", flush=True)
                         else:
                             print(f"❌ Failed to close position: {msg}\n", flush=True)
 
@@ -392,17 +408,20 @@ def run_live_auto_trading(
                         if ok:
                             today_trades_count += 1
                             print(f"✅ {msg} (Trades Today: {today_trades_count})\n", flush=True)
-                            storage.record_trade({
-                                "order_id": ticket,
-                                "symbol": mt5_bridge.symbol,
-                                "direction": "BUY",
-                                "volume": lot,
-                                "entry_price": ask_price,
-                                "sl": suggested_sl,
-                                "tp": 0.0,
-                                "status": "OPEN",
-                                "opened_at": datetime.now(timezone.utc).isoformat()
-                            })
+                            try:
+                                storage.record_trade({
+                                    "order_id": ticket,
+                                    "symbol": mt5_bridge.symbol,
+                                    "direction": "BUY",
+                                    "volume": lot,
+                                    "entry_price": ask_price,
+                                    "sl": suggested_sl,
+                                    "tp": 0.0,
+                                    "status": "OPEN",
+                                    "opened_at": datetime.now(timezone.utc).isoformat()
+                                })
+                            except Exception as e:
+                                print(f"⚠️ Storage record warning: {e}", flush=True)
                         else:
                             print(f"❌ Buy Order Failed: {msg}\n", flush=True)
 
@@ -428,17 +447,20 @@ def run_live_auto_trading(
                         if ok:
                             today_trades_count += 1
                             print(f"✅ {msg} (Trades Today: {today_trades_count})\n", flush=True)
-                            storage.record_trade({
-                                "order_id": ticket,
-                                "symbol": mt5_bridge.symbol,
-                                "direction": "SELL",
-                                "volume": lot,
-                                "entry_price": bid_price,
-                                "sl": suggested_sl,
-                                "tp": 0.0,
-                                "status": "OPEN",
-                                "opened_at": datetime.now(timezone.utc).isoformat()
-                            })
+                            try:
+                                storage.record_trade({
+                                    "order_id": ticket,
+                                    "symbol": mt5_bridge.symbol,
+                                    "direction": "SELL",
+                                    "volume": lot,
+                                    "entry_price": bid_price,
+                                    "sl": suggested_sl,
+                                    "tp": 0.0,
+                                    "status": "OPEN",
+                                    "opened_at": datetime.now(timezone.utc).isoformat()
+                                })
+                            except Exception as e:
+                                print(f"⚠️ Storage record warning: {e}", flush=True)
                         else:
                             print(f"❌ Sell Order Failed: {msg}\n", flush=True)
 
@@ -467,6 +489,9 @@ if __name__ == "__main__":
     parser.add_argument("--no-news", action="store_true", help="Disable economic news shield")
     parser.add_argument("--mt5-path", type=str, default="", help="Path to specific MT5 terminal64.exe (e.g. 'C:\\Program Files\\MetaTrader 5 - Bot2\\terminal64.exe')")
     parser.add_argument("--magic-number", type=int, default=9050201, help="Unique Magic Number for order tracking (default 9050201)")
+    parser.add_argument("--login", type=int, default=0, help="MT5 Account Number to bind / connect to (e.g. 12345678)")
+    parser.add_argument("--server", type=str, default="", help="Broker server name (optional, e.g. 'Exness-MT5Real')")
+    parser.add_argument("--password", type=str, default="", help="Account password (optional, needed only if not already saved in MT5)")
     args = parser.parse_args()
 
     mode = "candle_vwap_cross" if args.candle_vwap_cross else args.trigger_mode
@@ -486,5 +511,8 @@ if __name__ == "__main__":
         trigger_mode=mode,
         lot=args.lot,
         mt5_path=args.mt5_path if args.mt5_path.strip() else None,
-        magic_number=args.magic_number
+        magic_number=args.magic_number,
+        login=args.login if args.login > 0 else None,
+        server=args.server if args.server.strip() else None,
+        password=args.password if args.password.strip() else None
     )

@@ -115,6 +115,51 @@ class BotStorage:
         """Alias for save_trade."""
         return self.save_trade(trade_data)
 
+    def update_closed_trade(
+        self,
+        ticket: int,
+        exit_price: float,
+        net_pnl_usd: float = 0.0,
+        exit_reason: str = "Closed",
+        exit_time: Optional[str] = None
+    ) -> bool:
+        """Updates an existing trade record with exit details and PnL."""
+        try:
+            now = exit_time or datetime.now(timezone.utc).isoformat()
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    UPDATE trades
+                    SET exit_time = ?,
+                        exit_price = ?,
+                        net_pnl_usd = CASE WHEN ? != 0.0 THEN ? ELSE net_pnl_usd END,
+                        exit_reason = ?
+                    WHERE ticket = ?
+                """, (now, exit_price, net_pnl_usd, net_pnl_usd, exit_reason, ticket))
+                conn.commit()
+                if cursor.rowcount > 0:
+                    return True
+
+                # If record didn't exist in local DB (e.g. opened before bot run), insert closed trade
+                cursor.execute("""
+                    INSERT INTO trades (
+                        ticket, direction, entry_time, entry_price, stop_loss, take_profit,
+                        lot_size, exit_time, exit_price, exit_reason, net_pnl_usd,
+                        pnl_r_multiple, spread_paid_usd, commission_paid_usd, pattern_name,
+                        is_demo, magic_number, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    ticket, "UNKNOWN", now, exit_price, 0.0, 0.0,
+                    0.02, now, exit_price, exit_reason, net_pnl_usd,
+                    0.0, 0.0, 0.0, "EMA9_VWAP",
+                    1, 9050201, now
+                ))
+                conn.commit()
+                return True
+        except Exception as e:
+            print(f"⚠️ Storage error updating closed trade #{ticket}: {e}", flush=True)
+            return False
+
     def get_all_trades(self, limit: int = 200) -> List[Dict[str, Any]]:
         """Retrieves recent trades sorted newest first."""
         with self._get_connection() as conn:

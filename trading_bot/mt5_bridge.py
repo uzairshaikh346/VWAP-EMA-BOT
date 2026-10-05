@@ -72,7 +72,14 @@ class MT5Bridge:
         self.sim_positions: Dict[int, Dict[str, Any]] = {}
         self.ticket_counter = 5000000
 
-    def connect(self, path: Optional[str] = None) -> Tuple[bool, str]:
+    def connect(
+        self,
+        path: Optional[str] = None,
+        login: Optional[int] = None,
+        password: Optional[str] = None,
+        server: Optional[str] = None,
+        portable: bool = False
+    ) -> Tuple[bool, str]:
         """Initializes connection to MetaTrader5 terminal."""
         if not MT5_AVAILABLE:
             self.is_connected = True
@@ -80,14 +87,35 @@ class MT5Bridge:
             return True, "Running in High-Fidelity Simulation Mode (Native MT5 requires Windows + MT5 Terminal)"
 
         try:
-            init_kwargs = {}
+            init_kwargs: Dict[str, Any] = {}
             if path:
                 init_kwargs["path"] = path
+            if login:
+                init_kwargs["login"] = int(login)
+            if password:
+                init_kwargs["password"] = password
+            if server:
+                init_kwargs["server"] = server
+            if portable:
+                init_kwargs["portable"] = True
 
             if not mt5.initialize(**init_kwargs):
                 err = mt5.last_error()
                 self.is_connected = False
                 return False, f"MT5 initialization failed: {err}"
+
+            # If a specific login was requested, verify and ensure we are on that account
+            if login:
+                acc = mt5.account_info()
+                if acc and acc.login != int(login):
+                    login_kwargs: Dict[str, Any] = {"login": int(login)}
+                    if password:
+                        login_kwargs["password"] = password
+                    if server:
+                        login_kwargs["server"] = server
+                    if not mt5.login(**login_kwargs):
+                        err = mt5.last_error()
+                        return False, f"Failed to login to requested account #{login}: {err}"
 
             self.is_connected = True
             self.is_simulation = False
@@ -200,6 +228,59 @@ class MT5Bridge:
             trade_contract_size=info.trade_contract_size
         )
 
+    def get_available_symbols(self, filter_str: Optional[str] = None) -> List[str]:
+        """Returns list of symbols available on connected broker terminal."""
+        if self.is_simulation or not MT5_AVAILABLE or not self.is_connected:
+            return ["XAUUSD", "XAUUSDm", "USTECm", "US100m", "US500m", "EURUSD"]
+
+        symbols = mt5.symbols_get()
+        if symbols is None:
+            return []
+
+        names = [s.name for s in symbols]
+        if filter_str:
+            names = [n for n in names if filter_str.upper() in n.upper()]
+        return names
+
+    def resolve_symbol(self, requested_symbol: str) -> str:
+        """
+        Resolves generic symbol aliases (NQ, ES, GOLD) to broker's exact symbol name.
+        Examples:
+          'NQ' -> 'USTECm', 'US100', 'NAS100', 'USTEC'
+          'ES' -> 'US500m', 'SPX500', 'US500', 'USA500'
+          'GOLD' -> 'XAUUSDm', 'XAUUSD'
+        """
+        if self.is_simulation or not MT5_AVAILABLE or not self.is_connected:
+            return requested_symbol
+
+        aliases = {
+            "NQ": ["USTEC", "US100", "NAS100", "USTECH", "NQ", "NDX", "TECH100"],
+            "ES": ["US500", "SPX500", "SP500", "USA500", "ES", "SPX"],
+            "GOLD": ["XAUUSD", "GOLD"]
+        }
+        req_upper = requested_symbol.upper()
+
+        symbols = mt5.symbols_get()
+        if symbols is None:
+            return requested_symbol
+
+        all_names = [s.name for s in symbols]
+
+        # Exact match check first
+        for name in all_names:
+            if name.upper() == req_upper:
+                return name
+
+        # Candidate alias check
+        candidates = aliases.get(req_upper, [req_upper])
+        for cand in candidates:
+            # Match exact or with prefix/suffix (e.g. USTECm, US100_c)
+            for name in all_names:
+                if cand in name.upper():
+                    return name
+
+        return requested_symbol
+
     def get_rates(self, symbol: Optional[str] = None, count: int = 150) -> Any:
         """
         Fetches rates and returns them in named bar format or dict format compatible with Streamlit app.
@@ -243,9 +324,17 @@ class MT5Bridge:
         }
         mt5_tf = tf_map.get(timeframe_str.upper(), getattr(mt5, "TIMEFRAME_M1", 1))
 
+        info = mt5.symbol_info(sym)
+        if info is not None and not info.visible:
+            mt5.symbol_select(sym, True)
+
         rates = mt5.copy_rates_from_pos(sym, mt5_tf, 0, count)
         if rates is None or len(rates) == 0:
-            raise RuntimeError(f"Failed to fetch {timeframe_str} rates for {sym}: {mt5.last_error()}")
+            # Try one more time after selecting symbol
+            mt5.symbol_select(sym, True)
+            rates = mt5.copy_rates_from_pos(sym, mt5_tf, 0, count)
+            if rates is None or len(rates) == 0:
+                raise RuntimeError(f"Failed to fetch {timeframe_str} rates for {sym}: {mt5.last_error()}")
 
         times = [datetime.fromtimestamp(r['time'], tz=timezone.utc).isoformat() for r in rates]
         opens = [float(r['open']) for r in rates]
