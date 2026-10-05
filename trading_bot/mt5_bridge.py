@@ -11,7 +11,9 @@ Features:
    - Queries exact broker spread and point values via symbol_info().
 """
 
+import glob
 import os
+import subprocess
 import sys
 import time
 from dataclasses import dataclass
@@ -72,6 +74,50 @@ class MT5Bridge:
         self.sim_positions: Dict[int, Dict[str, Any]] = {}
         self.ticket_counter = 5000000
 
+    def _find_terminal_by_login(self, target_login: int) -> Optional[str]:
+        """Finds which MT5 terminal on Windows is currently logged into target_login."""
+        if not MT5_AVAILABLE or sys.platform != "win32":
+            return None
+
+        candidates: List[str] = []
+        try:
+            cmd = [
+                "powershell",
+                "-NoProfile",
+                "-Command",
+                "Get-Process -Name terminal64,terminal -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Path"
+            ]
+            out = subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL)
+            for line in out.strip().splitlines():
+                p = line.strip().strip('"')
+                if p and os.path.exists(p) and p not in candidates:
+                    candidates.append(p)
+        except Exception:
+            pass
+
+        for pattern in [
+            r"C:\Program Files\*\terminal64.exe",
+            r"C:\Program Files (x86)\*\terminal64.exe",
+            r"C:\MT5*\terminal64.exe",
+            r"D:\*\terminal64.exe",
+        ]:
+            for p in glob.glob(pattern):
+                if os.path.exists(p) and p not in candidates:
+                    candidates.append(p)
+
+        for p in candidates:
+            try:
+                if mt5.initialize(path=p):
+                    acc = mt5.account_info()
+                    is_match = (acc is not None and acc.login == target_login)
+                    mt5.shutdown()
+                    if is_match:
+                        return p
+            except Exception:
+                pass
+
+        return None
+
     def connect(
         self,
         path: Optional[str] = None,
@@ -87,14 +133,32 @@ class MT5Bridge:
             return True, "Running in High-Fidelity Simulation Mode (Native MT5 requires Windows + MT5 Terminal)"
 
         try:
+            target_path = path
+
+            # If user provided a specific login but no path, attempt to auto-find which terminal runs it
+            if login and not target_path:
+                # 1. Check if the currently active terminal is already on target login
+                if mt5.initialize():
+                    acc = mt5.account_info()
+                    if acc and acc.login == int(login):
+                        self.is_connected = True
+                        self.is_simulation = False
+                        return True, f"Connected to active MetaTrader 5 Terminal (Account #{login})"
+                    mt5.shutdown()
+
+                # 2. Search other running MT5 terminals on the system
+                detected_path = self._find_terminal_by_login(int(login))
+                if detected_path:
+                    target_path = detected_path
+                    print(f"🎯 Auto-attached to MT5 Terminal running account #{login}: {detected_path}", flush=True)
+
             init_kwargs: Dict[str, Any] = {}
-            if path:
-                init_kwargs["path"] = path
-            if login:
+            if target_path:
+                init_kwargs["path"] = target_path
+            # Note: mt5.initialize only accepts login if password and server are also provided
+            if login and password and server:
                 init_kwargs["login"] = int(login)
-            if password:
                 init_kwargs["password"] = password
-            if server:
                 init_kwargs["server"] = server
             if portable:
                 init_kwargs["portable"] = True
@@ -104,18 +168,20 @@ class MT5Bridge:
                 self.is_connected = False
                 return False, f"MT5 initialization failed: {err}"
 
-            # If a specific login was requested, verify and ensure we are on that account
+            # Verify active account
             if login:
                 acc = mt5.account_info()
                 if acc and acc.login != int(login):
-                    login_kwargs: Dict[str, Any] = {"login": int(login)}
-                    if password:
-                        login_kwargs["password"] = password
-                    if server:
-                        login_kwargs["server"] = server
-                    if not mt5.login(**login_kwargs):
-                        err = mt5.last_error()
-                        return False, f"Failed to login to requested account #{login}: {err}"
+                    if password and server:
+                        if not mt5.login(login=int(login), password=password, server=server):
+                            err = mt5.last_error()
+                            return False, f"Failed to switch to requested account #{login}: {err}"
+                    else:
+                        return False, (
+                            f"Connected to MT5 terminal, but active account is #{acc.login} (Server: {acc.server}) "
+                            f"instead of requested #{login}. Please open the MT5 terminal logged into #{login} "
+                            f"or specify --mt5-path to that terminal."
+                        )
 
             self.is_connected = True
             self.is_simulation = False
