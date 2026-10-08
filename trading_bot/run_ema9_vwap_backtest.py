@@ -53,6 +53,7 @@ from trading_bot.strategy import (
     calculate_ema,
     calculate_session_vwap,
     calculate_atr,
+    calculate_adx,
     is_ema9_vwap_session_active,
     evaluate_trend_exit
 )
@@ -65,10 +66,14 @@ def run_ema9_vwap_backtest(
     starting_balance: float = 100.0,
     lot_size: float = 0.02,
     daily_max_loss: float = 0.0,
+    daily_profit_target: float = 0.0,
     max_daily_trades: int = 0,
     max_session_losses: int = 0,
+    session: str = "both",
     atr_mult: float = 2.0,
     min_sl: float = 0.0,
+    min_adx: float = 0.0,
+    adx_period: int = 14,
     max_ema_gap: float = 0.0,
     breakeven_atr: float = 0.0,
     use_200_ema: bool = False,
@@ -76,12 +81,26 @@ def run_ema9_vwap_backtest(
     news_freeze_mins: int = 30,
     mt5_path: Optional[str] = None
 ):
+    session_str = session.lower().strip()
+    if session_str == "asia":
+        session_header = "Asian ONLY (00:00-08:00) Server Time"
+        excluded_header = "London, London_Pre, NY, Overlap & Off-Hours (08:00-24:00)"
+    elif session_str == "london":
+        session_header = "London ONLY (12:00-17:00) Server Time"
+        excluded_header = "Asian, London_Pre, NY, Overlap & Off-Hours (00:00-12:00 & 17:00-24:00)"
+    elif session_str == "all":
+        session_header = "All Sessions (24 Hours) Server Time"
+        excluded_header = "None"
+    else:
+        session_header = "Asian (00:00-08:00) & London (12:00-17:00) Server Time"
+        excluded_header = "London_Pre (08-12), NY & Overlap (17-24)"
+
     print("=" * 95, flush=True)
     print("  🏛️  EMA9 + VWAP CROSS STRATEGY (GOLD SCALPING ADAPTATION)", flush=True)
     print("===============================================================================================", flush=True)
     print(f"  📊 Asset:                   {symbol} (M5 Timeframe)", flush=True)
-    print(f"  ⏰ Trading Sessions:        Asian (00:00-08:00) & London (12:00-17:00) Server Time", flush=True)
-    print(f"  🛑 Excluded Sessions:       London_Pre (08-12), NY & Overlap (17-24)", flush=True)
+    print(f"  ⏰ Trading Sessions:        {session_header}", flush=True)
+    print(f"  🛑 Excluded Sessions:       {excluded_header}", flush=True)
     print(f"  💰 Account Capital:         ${starting_balance:.2f} USD (Fixed Lot: {lot_size})", flush=True)
     sl_desc = f"{atr_mult} x ATR(14)" if min_sl == 0 else f"{atr_mult} x ATR(14) (Min SL: ${min_sl:.2f})"
     print(f"  🛡️ Protective SL:           {sl_desc} | Exit: 20% Candle Range Beyond EMA9", flush=True)
@@ -95,12 +114,16 @@ def run_ema9_vwap_backtest(
         print(f"  🎯 Breakeven Trigger:       At +{breakeven_atr:.1f} x ATR Profit (Moves SL to Entry + Spread)", flush=True)
     if max_ema_gap > 0:
         print(f"  🛑 Max EMA Gap Filter:      {max_ema_gap:.2f} x ATR (Skips overextended entries)", flush=True)
+    if min_adx > 0:
+        print(f"  📈 ADX Anti-Chop Filter:    >= {min_adx:.1f} (ADX Period: {adx_period}) [Skips low momentum / flat market]", flush=True)
     if max_daily_trades > 0:
         print(f"  🛑 Max Daily Trades:        {max_daily_trades} Trades/day Max", flush=True)
     if max_session_losses > 0:
         print(f"  🛑 Session Loss Pause:      {max_session_losses} Consecutive Losses halts current session only", flush=True)
     if daily_max_loss > 0:
         print(f"  🛑 Daily SL Block / Shield: -${daily_max_loss:.2f} USD (Trading halted for the day if hit)", flush=True)
+    if daily_profit_target > 0:
+        print(f"  🎯 Daily Profit Target:     +${daily_profit_target:.2f} USD (Trading halted for the day once hit)", flush=True)
     print("===============================================================================================\n", flush=True)
 
     news_filter = EconomicNewsFilter(
@@ -144,6 +167,7 @@ def run_ema9_vwap_backtest(
     vwap_vals = calculate_session_vwap(times, highs, lows, closes, volumes, anchor_hour_utc=0)
     atr_vals = calculate_atr(highs, lows, closes, period=14)
     ema200_vals = calculate_ema(closes, period=200)
+    adx_vals = calculate_adx(highs, lows, closes, period=adx_period)
 
     # Simulation state
     balance = starting_balance
@@ -156,6 +180,7 @@ def run_ema9_vwap_backtest(
     # Daily aggregation
     daily_stats: Dict[str, Dict[str, Any]] = {}
     shield_triggered_days = 0
+    target_hit_days = 0
 
     spread_usd = 0.25  # Standard average Exness gold spread ~ $0.25 per oz
 
@@ -185,7 +210,8 @@ def run_ema9_vwap_backtest(
                 "losses": 0,
                 "pnl": 0.0,
                 "end_balance": balance,
-                "shield_hit": False
+                "shield_hit": False,
+                "target_hit": False
             }
 
         c_open = opens[i]
@@ -290,6 +316,11 @@ def run_ema9_vwap_backtest(
                 if daily_max_loss > 0 and loss_from_day_start >= daily_max_loss:
                     daily_stats[day_key]["shield_hit"] = True
 
+                # Check if balance gained >= daily_profit_target above day start balance
+                profit_from_day_start = balance - daily_stats[day_key]["start_balance"]
+                if daily_profit_target > 0 and profit_from_day_start >= daily_profit_target:
+                    daily_stats[day_key]["target_hit"] = True
+
                 if pnl < 0:
                     session_loss_count += 1
                 else:
@@ -306,11 +337,31 @@ def run_ema9_vwap_backtest(
                 daily_stats[day_key]["shield_hit"] = True
                 continue
 
+            # Check Daily Profit Target: If balance reached day_start_bal + daily_profit_target
+            profit_from_day_start = balance - day_start_bal
+            if daily_profit_target > 0 and profit_from_day_start >= daily_profit_target:
+                daily_stats[day_key]["target_hit"] = True
+                continue
+
             # Check Max Daily Trades Limit
             if max_daily_trades > 0 and daily_stats[day_key]["trades"] >= max_daily_trades:
                 continue
 
             is_active, session_name = is_ema9_vwap_session_active(dt)
+            if session_str == "asia":
+                if not (0 <= dt.hour < 8):
+                    is_active = False
+                else:
+                    session_name = f"Asian Session ({dt.hour:02d}:{dt.minute:02d} / 00:00-08:00 Server Time)"
+            elif session_str == "london":
+                if not (12 <= dt.hour < 17):
+                    is_active = False
+                else:
+                    session_name = f"London Session ({dt.hour:02d}:{dt.minute:02d} / 12:00-17:00 Server Time)"
+            elif session_str == "all":
+                is_active = True
+                session_name = f"All-Day Session ({dt.hour:02d}:{dt.minute:02d})"
+
             if is_active:
                 if session_name != curr_session_name:
                     curr_session_name = session_name
@@ -332,6 +383,11 @@ def run_ema9_vwap_backtest(
 
                 # Check Overextension Gap filter (skips entry if close is stretched too far from EMA9)
                 if max_ema_gap > 0 and (ema_gap > max_ema_gap * c_atr):
+                    continue
+
+                # Check ADX Anti-Chop Filter: Skips entries when market has low momentum / ranging chop
+                c_adx = adx_vals[i]
+                if min_adx > 0 and c_adx < min_adx:
                     continue
 
                 # Long (Buy) Entry:
@@ -394,6 +450,9 @@ def run_ema9_vwap_backtest(
         if st["shield_hit"]:
             status_tag = f"🛑 Daily SL Shield (-${daily_max_loss:.0f})"
             shield_triggered_days += 1
+        elif st.get("target_hit", False):
+            status_tag = f"🎯 Daily Target Hit (+${daily_profit_target:.0f})"
+            target_hit_days += 1
         elif pnl >= 0:
             status_tag = "🟢 Green Day"
         else:
@@ -422,6 +481,8 @@ def run_ema9_vwap_backtest(
     print(f"  📉 Maximum Drawdown:         ${max_drawdown_usd:.2f} USD", flush=True)
     if daily_max_loss > 0:
         print(f"  🛡️ Days Shield Triggered:    {shield_triggered_days} Days halted at Daily SL limit (-${daily_max_loss:.2f})", flush=True)
+    if daily_profit_target > 0:
+        print(f"  🎯 Days Target Achieved:     {target_hit_days} Days halted at Daily Profit Target (+${daily_profit_target:.2f})", flush=True)
     print("===============================================================================================\n", flush=True)
 
 
@@ -432,10 +493,14 @@ if __name__ == "__main__":
     parser.add_argument("--balance", type=float, default=100.0, help="Starting account balance in USD (default: 100)")
     parser.add_argument("--lot", type=float, default=0.02, help="Fixed lot size (default: 0.02)")
     parser.add_argument("--daily-max-loss", type=float, default=0.0, help="Daily Max Loss Block in USD (default 0.0 = disabled, set e.g. 25.0 to enable)")
+    parser.add_argument("--daily-profit-target", type=float, default=0.0, help="Daily Profit Target in USD (e.g. 10.0 = stops trading once day starting balance + $10 is reached)")
     parser.add_argument("--max-daily-trades", type=int, default=0, help="Max trades allowed per day (e.g. 3, 0 = unlimited)")
     parser.add_argument("--max-session-losses", type=int, default=0, help="Max consecutive losses before pausing current session (e.g. 2, 0 = unlimited)")
+    parser.add_argument("--session", type=str, default="both", choices=["both", "asia", "london", "all"], help="Trading session: 'asia' (Asian only 00:00-08:00), 'london' (London only 12:00-17:00), 'both' (Asian+London, default), 'all' (24 Hours)")
     parser.add_argument("--atr-mult", type=float, default=2.0, help="ATR SL multiplier (default 2.0, e.g. 1.5 or 2.0)")
     parser.add_argument("--min-sl", type=float, default=0.0, help="Minimum Stop Loss in USD (default 0.0, e.g. 2.5)")
+    parser.add_argument("--min-adx", type=float, default=0.0, help="Minimum ADX trend strength required to take trade (e.g. 20.0 or 25.0). Default 0.0 = disabled")
+    parser.add_argument("--adx-period", type=int, default=14, help="ADX period (default: 14)")
     parser.add_argument("--max-ema-gap", type=float, default=0.0, help="Max allowed gap between Close and EMA9 in ATR units (e.g. 1.0 to skip overextensions, default 0.0 = disabled)")
     parser.add_argument("--breakeven-atr", type=float, default=0.0, help="Move SL to Breakeven (+Spread) when profit reaches N x ATR (e.g. 1.5 or 2.0, default 0.0 = disabled)")
     parser.add_argument("--use-200-ema", action="store_true", help="Filter entries with 200 EMA (Buys strictly above 200 EMA, Sells strictly below)")
@@ -450,10 +515,14 @@ if __name__ == "__main__":
         starting_balance=args.balance,
         lot_size=args.lot,
         daily_max_loss=args.daily_max_loss,
+        daily_profit_target=args.daily_profit_target,
         max_daily_trades=args.max_daily_trades,
         max_session_losses=args.max_session_losses,
+        session=args.session,
         atr_mult=args.atr_mult,
         min_sl=args.min_sl,
+        min_adx=args.min_adx,
+        adx_period=args.adx_period,
         max_ema_gap=args.max_ema_gap,
         breakeven_atr=args.breakeven_atr,
         use_200_ema=args.use_200_ema,

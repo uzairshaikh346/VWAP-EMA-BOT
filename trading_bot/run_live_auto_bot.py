@@ -54,6 +54,7 @@ from trading_bot.strategy import (
     calculate_ema,
     calculate_session_vwap,
     calculate_atr,
+    calculate_adx,
     is_ema9_vwap_session_active,
     evaluate_trend_exit
 )
@@ -65,22 +66,36 @@ def run_live_auto_trading(
     symbol: str = "XAUUSDm",
     enable_news_shield: bool = True,
     daily_max_loss: float = 0.0,
+    daily_profit_target: float = 0.0,
     max_daily_trades: int = 0,
     max_session_losses: int = 0,
     atr_mult: float = 2.0,
     min_sl: float = 0.0,
+    min_adx: float = 0.0,
+    adx_period: int = 14,
     max_ema_gap: float = 0.0,
     max_candle_range: float = 0.0,
     breakeven_atr: float = 0.0,
     use_200_ema: bool = False,
     trigger_mode: str = "ema_cross",
     lot: float = 0.02,
+    session: str = "both",
     mt5_path: Optional[str] = None,
     magic_number: int = 9050201,
     login: Optional[int] = None,
     server: Optional[str] = None,
     password: Optional[str] = None
 ):
+    session_str = session.lower().strip()
+    if session_str == "asia":
+        session_header = "Asian ONLY (00:00–08:00) Server Time"
+    elif session_str == "london":
+        session_header = "London ONLY (12:00–17:00) Server Time"
+    elif session_str == "all":
+        session_header = "All Day (24 Hours) Server Time"
+    else:
+        session_header = "Asian (00:00–08:00) + London (12:00–17:00) Server Time"
+
     print("=" * 95, flush=True)
     print("🚀 STARTING LIVE AUTONOMOUS ENGINE: EMA9 + VWAP CROSS STRATEGY (GOLD SCALPING)", flush=True)
     print(f"📊 Instrument: {symbol} | Timeframe: M5 | Lot Size: {lot} | Magic: {magic_number}", flush=True)
@@ -90,7 +105,7 @@ def run_live_auto_trading(
         print(f"👤 Targeted Account: #{login} (Server: {server or 'Current'})", flush=True)
     trigger_desc = "Candle crosses VWAP (Aligned with EMA9)" if trigger_mode == "candle_vwap_cross" else "9 EMA crosses VWAP (Aligned with Candle)"
     print(f"🎯 Entry Mode: {trigger_desc}", flush=True)
-    print("⏰ Trading Sessions: Asian (00:00–08:00) + London (12:00–17:00) Server Time", flush=True)
+    print(f"⏰ Trading Sessions: {session_header}", flush=True)
     sl_desc = f"{atr_mult} x ATR(14)" if min_sl == 0 else f"{atr_mult} x ATR(14) (Min SL: ${min_sl:.2f})"
     print(f"🛡️ Exits: Hard SL = {sl_desc} | Trend Reversal Exit = 20% candle range beyond EMA9", flush=True)
     if use_200_ema:
@@ -101,12 +116,16 @@ def run_live_auto_trading(
         print(f"🛑 Max EMA Gap Filter: {max_ema_gap:.2f} x ATR (Skips overextended entries)", flush=True)
     if max_candle_range > 0:
         print(f"🛑 Giant Candle Filter: {max_candle_range:.2f} x ATR (Skips climax spike candles)", flush=True)
+    if min_adx > 0:
+        print(f"📈 ADX Anti-Chop Filter: >= {min_adx:.1f} (ADX Period: {adx_period}) [Skips low momentum / flat market]", flush=True)
     if max_daily_trades > 0:
         print(f"🛑 Max Daily Trades: {max_daily_trades} Trades/day Max", flush=True)
     if max_session_losses > 0:
         print(f"🛑 Session Loss Pause: {max_session_losses} Consecutive Losses halts current session only", flush=True)
     if daily_max_loss > 0:
         print(f"🛑 Daily SL Block / Shield: -${daily_max_loss:.2f} USD (New entries blocked if hit today)", flush=True)
+    if daily_profit_target > 0:
+        print(f"🎯 Daily Profit Target: +${daily_profit_target:.2f} USD (Trading halted once day start + target hit)", flush=True)
     print("=" * 95, flush=True)
 
     storage = BotStorage()
@@ -147,6 +166,7 @@ def run_live_auto_trading(
 
     last_evaluated_bar_time = None
     last_shield_print_time = 0
+    last_target_print_time = 0
     processed_deal_tickets = set()
     today_realized_pnl = 0.0
     today_trades_count = 0
@@ -214,6 +234,7 @@ def run_live_auto_trading(
             vwap_vals = calculate_session_vwap(times, highs, lows, closes, volumes, anchor_hour_utc=0)
             atr_vals = calculate_atr(highs, lows, closes, period=14)
             ema200_vals = calculate_ema(closes, period=200)
+            adx_vals = calculate_adx(highs, lows, closes, period=adx_period)
 
             # Current completed bar is the penultimate bar [-2] if last is still building, or [-1]
             # In live MT5 rates, [-1] is currently forming bar, [-2] is last closed candle.
@@ -229,10 +250,17 @@ def run_live_auto_trading(
                     bar_dt = datetime.now(timezone.utc)
             elif isinstance(completed_time, (int, float)):
                 bar_dt = datetime.fromtimestamp(completed_time, tz=timezone.utc)
+            if session_str == "asia":
+                is_session = (0 <= bar_dt.hour < 8)
+                session_name = f"Asian Session ({bar_dt.hour:02d}:{bar_dt.minute:02d} / 00:00-08:00 Server Time)" if is_session else f"Outside Asian Session ({bar_dt.hour:02d}:{bar_dt.minute:02d})"
+            elif session_str == "london":
+                is_session = (12 <= bar_dt.hour < 17)
+                session_name = f"London Session ({bar_dt.hour:02d}:{bar_dt.minute:02d} / 12:00-17:00 Server Time)" if is_session else f"Outside London Session ({bar_dt.hour:02d}:{bar_dt.minute:02d})"
+            elif session_str == "all":
+                is_session = True
+                session_name = f"All-Day Session ({bar_dt.hour:02d}:{bar_dt.minute:02d})"
             else:
-                bar_dt = completed_time
-
-            is_session, session_name = is_ema9_vwap_session_active(bar_dt)
+                is_session, session_name = is_ema9_vwap_session_active(bar_dt)
 
             c_close = closes[completed_idx]
             c_open = opens[completed_idx] if (opens and len(opens) > completed_idx) else c_close
@@ -242,6 +270,7 @@ def run_live_auto_trading(
             c_vwap = vwap_vals[completed_idx]
             c_atr = atr_vals[completed_idx]
             c_ema200 = ema200_vals[completed_idx]
+            c_adx = adx_vals[completed_idx]
 
             # 4. Check if a new M5 candle has closed
             is_new_candle = (completed_time != last_evaluated_bar_time)
@@ -256,7 +285,7 @@ def run_live_auto_trading(
                 pos_str = f"1 OPEN ({open_positions[0]['direction']} @ ${open_positions[0]['entry_price']:.2f})" if open_positions else "0 OPEN"
 
                 print(
-                    f"\n🕯️ [{time_str} | M5 CANDLE CLOSED] Close: ${c_close:.2f} | EMA9: ${c_ema9:.2f} | VWAP: ${c_vwap:.2f} | ATR: ${c_atr:.2f}\n"
+                    f"\n🕯️ [{time_str} | M5 CANDLE CLOSED] Close: ${c_close:.2f} | EMA9: ${c_ema9:.2f} | VWAP: ${c_vwap:.2f} | ATR: ${c_atr:.2f} | ADX: {c_adx:.1f}\n"
                     f"   ├─ ⏰ Session: {session_name}\n"
                     f"   ├─ 🎯 Candle Range: ${c_range:.2f} | 20% Exit Threshold: ${c_exit_thresh:.2f}\n"
                     f"   └─ 🛡️ Active Position: {pos_str}",
@@ -333,6 +362,14 @@ def run_live_auto_trading(
                             print(f"🛑 [DAILY SL BLOCK ACTIVE] Balance (${curr_bal:.2f}) dropped -${loss_from_day_start:.2f} below Day-Start Balance (${day_start_balance:.2f}, limit -${daily_max_loss:.2f})! Halting new entries for today. Resuming tomorrow at day open.", flush=True)
                         continue
 
+                    # Check Daily Profit Target: If balance gains >= daily_profit_target from Day Start Balance
+                    profit_from_day_start = curr_bal - day_start_balance
+                    if daily_profit_target > 0 and profit_from_day_start >= daily_profit_target:
+                        if (time.time() - last_target_print_time) > 300:
+                            last_target_print_time = time.time()
+                            print(f"🎯 [DAILY TARGET ACHIEVED] Balance (${curr_bal:.2f}) reached +${profit_from_day_start:.2f} profit over Day-Start Balance (${day_start_balance:.2f}, target +${daily_profit_target:.2f})! Profit locked for today. Halting new entries. Resuming tomorrow at day open.", flush=True)
+                        continue
+
                     if not is_session:
                         # Outside allowed session (only Asian 00-08 and London 12-17 allowed)
                         continue
@@ -369,6 +406,11 @@ def run_live_auto_trading(
 
                     if max_candle_range > 0 and (candle_range > max_candle_range * c_atr):
                         print(f"⚠️ [GIANT CANDLE SKIPPED] Candle range (${candle_range:.2f}) > {max_candle_range:.2f}x ATR (${max_candle_range * c_atr:.2f}). Skipping climax spike.", flush=True)
+                        continue
+
+                    # Check ADX Anti-Chop Trend Strength Filter: Skips entries when market has low momentum / ranging chop
+                    if min_adx > 0 and c_adx < min_adx:
+                        print(f"⚠️ [ADX CHOP BLOCKED] Signal skipped: Current ADX ({c_adx:.1f}) < {min_adx:.1f} (Market in flat/ranging regime)", flush=True)
                         continue
 
                     if trigger_mode == "candle_vwap_cross":
@@ -476,10 +518,14 @@ if __name__ == "__main__":
     parser.add_argument("--balance", type=float, default=100.0, help="Starting account balance (ignored in live execution, reads broker balance)")
     parser.add_argument("--lot", type=float, default=0.02, help="Fixed lot size (default 0.02)")
     parser.add_argument("--daily-max-loss", type=float, default=0.0, help="Daily Max Loss Block in USD (default 0.0 = disabled, set e.g. 25.0 to enable)")
+    parser.add_argument("--daily-profit-target", type=float, default=0.0, help="Daily Take Profit target in USD (e.g. 10.0 = stops trading once day starting balance + $10 is reached)")
     parser.add_argument("--max-daily-trades", type=int, default=0, help="Max trades allowed per day (e.g. 3, 0 = unlimited)")
     parser.add_argument("--max-session-losses", type=int, default=0, help="Max consecutive losses before pausing current session (e.g. 2, 0 = unlimited)")
+    parser.add_argument("--session", type=str, default="both", choices=["both", "asia", "london", "all"], help="Trading session: 'asia' (Asian only 00:00-08:00), 'london' (London only 12:00-17:00), 'both' (Asian+London, default), 'all' (24 Hours)")
     parser.add_argument("--atr-mult", type=float, default=2.0, help="ATR SL multiplier (default 2.0, e.g. 1.5 or 2.0)")
     parser.add_argument("--min-sl", type=float, default=0.0, help="Minimum Stop Loss in USD (default 0.0, e.g. 2.5)")
+    parser.add_argument("--min-adx", type=float, default=0.0, help="Minimum ADX trend strength required (e.g. 20.0 or 25.0). Default 0.0 = disabled")
+    parser.add_argument("--adx-period", type=int, default=14, help="ADX lookback period (default 14)")
     parser.add_argument("--max-ema-gap", type=float, default=0.0, help="Max allowed gap between Close and EMA9 in ATR units (e.g. 0.8 or 1.0, default 0.0 = disabled)")
     parser.add_argument("--max-candle-range", type=float, default=0.0, help="Max trigger candle range in ATR units (e.g. 1.8 or 2.0, default 0.0 = disabled)")
     parser.add_argument("--breakeven-atr", type=float, default=0.0, help="Move SL to Breakeven (+Spread) once profit reaches N x ATR (e.g. 1.5 or 2.0, default 0.0 = disabled)")
@@ -500,10 +546,14 @@ if __name__ == "__main__":
         symbol=args.symbol,
         enable_news_shield=not args.no_news,
         daily_max_loss=args.daily_max_loss,
+        daily_profit_target=args.daily_profit_target,
         max_daily_trades=args.max_daily_trades,
         max_session_losses=args.max_session_losses,
+        session=args.session,
         atr_mult=args.atr_mult,
         min_sl=args.min_sl,
+        min_adx=args.min_adx,
+        adx_period=args.adx_period,
         max_ema_gap=args.max_ema_gap,
         max_candle_range=args.max_candle_range,
         breakeven_atr=args.breakeven_atr,
